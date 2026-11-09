@@ -1,0 +1,12 @@
+INFO:     Started server process [173477]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:9000 (Press CTRL+C to quit)
+💳 Stripe Auth API (OSPL)
+📍 Port: 9000
+📌 /stripe_auth?cc=4111111111111111|12|25|123
+👤 Dev: @chirgg_911
+INFO:     127.0.0.1:53314 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34774 - "GET /stripe_auth?cc=4111111111111111|12|25|123 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45168 - "GET /stripe_auth?cc=4111111111111111|12|25|123 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52002 - "GET /stripe_auth?cc=4111111111111111|12|25|123 HTTP/1.1" 200 OK
